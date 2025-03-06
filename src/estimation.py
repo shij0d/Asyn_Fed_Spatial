@@ -447,7 +447,6 @@ class Worker():
     def __init__(self, worker_id:int, local_computation: LocalComputation, time_dict:Dict[StepType,float]):
         self.worker_id = worker_id
         self.time_dict = time_dict #the time needed for finishing the C&C for the upcoming parameter
-        self.cur_param=None # the current parameter that is being processed
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
         self.round = 0
         self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
@@ -495,14 +494,10 @@ class Worker():
         return LocalQuantity(self.worker_id, value, param.index)
     
     def compute_new_local_quantity(self)->LocalQuantity:
-        if self.cur_param:  # Check if the deque is not empty
-            local_quantity=self.compute_local_quantity(self.cur_param)
-            self.cur_param=None #fetch the current parameter
+        if self.local_params:  # Check if the deque is not empty
+            param = self.local_params.popleft()  # Pop the leftmost item from the deque
+            local_quantity=self.compute_local_quantity(param)
             return local_quantity
-        else:
-            #raise an error if there is no current parameter
-            raise ValueError("There is no current parameter")
-        
     def compute_para_ind_local_quantity(self)->Dict[str,torch.Tensor]: 
         #compute local quantity that is independent of the parameter
         para_ind_local_quantity={}
@@ -607,10 +602,11 @@ class  Server():
                 for i,w in enumerate(self.workers):
                     if time_min_index is not None:
                         if i==time_min_index:
-                            coming_times[i]=w.get_coming_time() 
+                            coming_times[i]=w.get_coming_time()
                         else:
                             coming_times[i]=coming_times[i]-time_min
                     else:
+                        
                         coming_times[i]=w.get_coming_time()
                 time_min_index=np.argmin(coming_times)
                 time_min=coming_times[time_min_index]
