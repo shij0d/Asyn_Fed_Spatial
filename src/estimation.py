@@ -447,6 +447,7 @@ class Worker():
     def __init__(self, worker_id:int, local_computation: LocalComputation, time_dict:Dict[StepType,float]):
         self.worker_id = worker_id
         self.time_dict = time_dict #the time needed for finishing the C&C for the upcoming parameter
+        self.cur_param=None
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
         self.round = 0
         self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
@@ -471,6 +472,11 @@ class Worker():
         return time
     def receive_param(self, param:Parameter):
         #when a new parameter is received, it is appended to the right of the deque
+        if self.local_params is not None:
+            for i, local_param in enumerate(self.local_params):
+                if local_param.index[1]==param.index[1]:
+                    self.local_params[i]=param
+                    return 
         self.local_params.append(param)
     
     def compute_local_quantity(self, param: Parameter,step: StepType=None)->LocalQuantity:
@@ -492,11 +498,12 @@ class Worker():
             # compute local quantity for theta
             value=self.local_computation.compute_local_for_theta(param)
         return LocalQuantity(self.worker_id, value, param.index)
-    
+    def set_cur_param(self):
+        if self.local_params:
+            self.cur_param=self.local_params.popleft()
     def compute_new_local_quantity(self)->LocalQuantity:
-        if self.local_params:  # Check if the deque is not empty
-            param = self.local_params.popleft()  # Pop the leftmost item from the deque
-            local_quantity=self.compute_local_quantity(param)
+        if self.cur_param:
+            local_quantity=self.compute_local_quantity(self.cur_param)
             return local_quantity
     def compute_para_ind_local_quantity(self)->Dict[str,torch.Tensor]: 
         #compute local quantity that is independent of the parameter
@@ -584,6 +591,7 @@ class  Server():
         self.param.index=(1,StepType.MU_SIGMA,0)
         self.broadcast_param(self.param)
         
+        
           
     def get_local_quantities_by_step(self,step:StepType):
         #update the global parameter by the local quantities
@@ -603,11 +611,12 @@ class  Server():
                     if time_min_index is not None:
                         if i==time_min_index:
                             coming_times[i]=w.get_coming_time()
+                            w.set_cur_param()
                         else:
                             coming_times[i]=coming_times[i]-time_min
                     else:
-                        
                         coming_times[i]=w.get_coming_time()
+                        w.set_cur_param()
                 time_min_index=np.argmin(coming_times)
                 time_min=coming_times[time_min_index]
                 worker=self.workers[time_min_index]
