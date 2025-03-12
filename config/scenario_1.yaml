@@ -1,0 +1,14 @@
+#Varying the step sizes
+seed: 1
+num_workers: 10
+alpha: 1
+length_scale: 0.1
+nu: 0.5
+num_samples: 10000
+min_dis: 0.02
+coefficients: [-1, 2, 3, -2, 1]
+noise_level: 2
+num_knots: 100
+concurrencies: [2,4,6,8,10]
+step_sizes: [0.1,0.2,0.4,0.6]
+

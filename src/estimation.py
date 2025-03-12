@@ -12,8 +12,11 @@ from src.utils import softplus, inv_softplus
 from warnings import warn
 import math
 import pickle
+import psutil
+import logging
 #from torch.autograd.functional import hessian
 #from torch.autograd import grad
+
 
 class StepType(Enum):
     MU_SIGMA = 1
@@ -34,12 +37,13 @@ class Parameter():
 
 def compute_average_param(params: List[Parameter]) -> Parameter:
         # Compute the average of the parameters
-        mu_avg = torch.mean(torch.stack([param.mu for param in params]), dim=0)
-        sigma_avg = torch.mean(torch.stack([param.sigma for param in params]), dim=0)
-        gamma_avg = torch.mean(torch.stack([param.gamma for param in params]), dim=0)
-        delta_avg = torch.mean(torch.stack([param.delta for param in params]), dim=0)
-        theta_avg = torch.mean(torch.stack([param.theta for param in params]), dim=0)
-        index = params[0].index
+        valid_params = [param for param in params if param is not None]
+        mu_avg = torch.mean(torch.stack([param.mu for param in valid_params]), dim=0)
+        sigma_avg = torch.mean(torch.stack([param.sigma for param in valid_params]), dim=0)
+        gamma_avg = torch.mean(torch.stack([param.gamma for param in valid_params]), dim=0)
+        delta_avg = torch.mean(torch.stack([param.delta for param in valid_params]), dim=0)
+        theta_avg = torch.mean(torch.stack([param.theta for param in valid_params]), dim=0)
+        index = valid_params[0].index
         return Parameter(mu_avg, sigma_avg, gamma_avg, delta_avg, theta_avg, index)
     
 class LocalQuantity():
@@ -71,6 +75,21 @@ class LocalQuantities():
                (local_quantity.index[0] == existing_quantity.index[0] and local_quantity.index[2] > existing_quantity.index[2]):
                 self.local_quantities_dict[worker_id][step] = local_quantity
     
+    def merge_new_dif(self,local_quantity: LocalQuantity):
+        worker_id = local_quantity.worker_id
+        step = local_quantity.index[1]
+        if worker_id not in self.local_quantities_dict:
+            self.local_quantities_dict[worker_id] = {}
+        if step not in self.local_quantities_dict[worker_id]:
+            self.local_quantities_dict[worker_id][step] = local_quantity
+        else:
+            existing_quantity = self.local_quantities_dict[worker_id][step]
+            if (local_quantity.index[0] > existing_quantity.index[0]) or \
+               (local_quantity.index[0] == existing_quantity.index[0] and local_quantity.index[2] > existing_quantity.index[2]):
+                for key in local_quantity.value.keys():
+                    existing_quantity.value[key] += local_quantity.value[key]
+                existing_quantity.index = local_quantity.index
+                
     
     def get_count_by_worker(self,worker_id:int)->int:
         return len(self.local_quantities_dict.get(worker_id,{}))
@@ -98,7 +117,13 @@ class LocalQuantities():
         for worker_id in self.local_quantities_dict.keys():
             if step in self.local_quantities_dict[worker_id]:
                 del self.local_quantities_dict[worker_id][step]
-            
+                
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_usage_gb = memory_info.rss / 1024 ** 3  # Convert bytes to GB
+    return memory_usage_gb
+          
 class LocalComputation():
     # The class that implements the computation in local workers
     def __init__(self,local_data:torch.Tensor, knots:torch.Tensor,\
@@ -179,7 +204,6 @@ class LocalComputation():
     
     def compute_local_for_theta(self,para:Parameter)-> Dict[str,torch.Tensor]:
         #gradient and Hessian
-        
         mu=para.mu
         sigma=para.sigma
         gamma=para.gamma 
@@ -196,16 +220,15 @@ class LocalComputation():
         local_B =self.local_B(theta) 
         local_errorv=self.local_errorv(gamma)
         
+        
         f_value:torch.Tensor = -n * torch.log(delta) + delta * (
             torch.trace(local_B.T @ local_B @ (sigma + mu @ mu.T))
             + 2 * local_errorv.T @ local_B @ mu
             + local_errorv.T @ local_errorv
         )
-
         # First backward pass: compute first-order gradient
-        f_value.backward(create_graph=True)  # Retain graph for Hessian
-        grad = theta.grad.clone()
-
+        grad = torch.autograd.grad(f_value, theta, create_graph=True)[0]  # Retain graph for Hessian
+        
         # Initialize Hessian
         hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float64)
 
@@ -219,7 +242,7 @@ class LocalComputation():
                 allow_unused=False  # Ensure all elements are used
             )[0]
             hessian[i] = g2.view(-1)  # Flatten to match Hessian shape
-
+        
         # Detach theta to prevent further graph retention
         theta = theta.detach()
         
@@ -314,14 +337,21 @@ class LocalComputation():
                 return value.numpy().flatten()
             return fun
         
-    def get_local_minimizer(self,param0:Parameter)->Parameter:
+    def get_local_minimizer(self,param0:Parameter,tol=None)->Parameter:
         #param0 is the initial parameter, and mu and Sigma can be ignored
         free_vector_GDT0=self.__Parameter2FreeVector_GDT(param0).numpy() # transfer to the free vector, should be in numpy form
         nllikf, nllikgf = self.local_neg_log_lik_wrapper(requires_grad=True)
-        result = minimize(fun=nllikf,
-                          x0=free_vector_GDT0,
-                          method="BFGS",
-                          jac=nllikgf)
+        if tol:
+            result = minimize(fun=nllikf,
+                            x0=free_vector_GDT0,
+                            method="BFGS",
+                            tol=tol,
+                            jac=nllikgf)
+        else:
+            result = minimize(fun=nllikf,
+                            x0=free_vector_GDT0,
+                            method="BFGS",
+                            jac=nllikgf)
         minimizer_lik = torch.tensor(result.x, dtype=torch.float64)
         param= self.__FreeVector2Parameter_GDT(minimizer_lik)
         local_for_mu_sigma=self.compute_local_for_mu_sigma(param)
@@ -337,10 +367,13 @@ class LocalComputation():
 class GlobalComputation():
     # The class that implements the computation in the server
     def __init__(self,knots:torch.Tensor,\
-        kernel:Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]):
+        kernel:Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],step_size_theta:float):
         self.knots=knots
         self.kernel=kernel
-        
+        self.step_size_theta=step_size_theta
+        self.global_para_ind_quantities:Dict[str,torch.Tensor]={}
+    def reset(self):
+        self.global_para_ind_quantities:Dict[str,torch.Tensor]={}
     def set_global_para_ind_quantities(self,global_para_ind_quantities:Dict[str,torch.Tensor]):
         self.global_para_ind_quantities=global_para_ind_quantities
         
@@ -434,7 +467,7 @@ class GlobalComputation():
         # Construct the diagonal matrix of modified eigenvalues
         modified_eigenvalue_matrix = torch.diag(modified_eigenvalues)
         modified_hess = eigenvectors@modified_eigenvalue_matrix@eigenvectors.T
-        step_size=self.global_para_ind_quantities['step_size']
+        step_size=self.step_size_theta
         
         invh_m_grad = torch.linalg.inv(modified_hess)@gradient
         theta = param.theta-step_size*invh_m_grad
@@ -449,36 +482,58 @@ class Worker():
         self.time_dict = time_dict #the time needed for finishing the C&C for the upcoming parameter
         self.cur_param=None
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
-        self.round = 0
+        self.coming_time=None
         self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
         self.local_computation=local_computation
+    def reset(self):
+        self.cur_param=None
+        self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
+        self.coming_time=None
+        self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
         
     def set_pre_local_quantity(self,local_quantity:LocalQuantity):
         step=local_quantity.index[1]
         self.pre_local_quantity_dict[step]=local_quantity
     
     def get_initial_param(self,param0: Parameter)->Parameter:
-        param=self.local_computation.get_local_minimizer(param0)
-    
-        return param
         
-    def get_coming_time(self):
-        #the function that sets the  C&C time for the upcoming parameter, which is just for simulation, in real world, it should be unknown until the C&C is finished
-        if self.local_params: 
-            param=self.local_params[0] # don't Pop the leftmost item from the deque
-            time=self.time_dict[param.index[1]] #plus some random part and the seed should be fixed 
+        try:
+            param = self.local_computation.get_local_minimizer(param0)
+            return param
+        except Exception as e:
+            logging.error(f"Error in get_initial_param: {e}")
+            return None
+        
+    def get_refresh_coming_time(self):
+        #the function that sets the C&C time for the upcoming parameter, which is just for simulation, in real world, it should be unknown until the C&C is finished
+        if self.cur_param: 
+            param=self.cur_param 
+            time=self.time_dict[param.index[1]] # maybe plus some random part and the seed should be fixed 
         else:
             time=np.inf
         return time
     def receive_param(self, param:Parameter):
-        #when a new parameter is received, it is appended to the right of the deque
-        if self.local_params is not None:
+        #when a new parameter is received, add it to the local parameters
+        id=None
+        if self.local_params is not None and len(self.local_params)>0:
             for i, local_param in enumerate(self.local_params):
                 if local_param.index[1]==param.index[1]:
-                    self.local_params[i]=param
-                    return 
-        self.local_params.append(param)
-    
+                    id=i
+        if id is None:
+            self.local_params.append(param)
+        else:
+            self.local_params[id]=param
+        #if the current parameter is None, set the current parameter as the first parameter in the deque
+        if self.cur_param is None:
+            self.set_cur_param() 
+            self.coming_time=self.get_refresh_coming_time()  
+            
+    def set_cur_param(self):
+        if self.local_params:
+            self.cur_param=self.local_params.popleft()
+        else:
+            self.cur_param=None
+            
     def compute_local_quantity(self, param: Parameter,step: StepType=None)->LocalQuantity:
         if step is None:
             step=param.index[1]
@@ -498,9 +553,7 @@ class Worker():
             # compute local quantity for theta
             value=self.local_computation.compute_local_for_theta(param)
         return LocalQuantity(self.worker_id, value, param.index)
-    def set_cur_param(self):
-        if self.local_params:
-            self.cur_param=self.local_params.popleft()
+    
     def compute_new_local_quantity(self)->LocalQuantity:
         if self.cur_param:
             local_quantity=self.compute_local_quantity(self.cur_param)
@@ -527,13 +580,21 @@ class  Server():
     def __init__(self,workers:List[Worker],concurrency:int,global_computation:GlobalComputation):
         self.param:Parameter = None # The global parameter for the model
         self.params_GDT:List[Parameter]=[] # The global parameters for the model
+        for w in workers:
+            w.reset()
         self.workers=workers # The workers in the system
         self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
         self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
-        #self.global_para_ind_quantities:Dict[str,torch.Tensor]={} # The global quantity that are independent of the parameter. For each key, there are average of the locals
         self.concurrency=concurrency # The number of workers that are needed to compute the global quantities
+        global_computation.reset()
         self.global_computation=global_computation
-    
+        self.time:float=0 # record the accumulated time
+        self.times_elapsed:List[float]=[] # record the time for each iteration 
+        #self.nums_local_quantities:Dict[int,Dict[StepType,int]]={} # record the number of local quantities that the server used for each step
+        #self.cur_num_local_quantities:Dict[StepType,int]={}
+        #self.recording_delay:Dict[Tuple[int,StepType,int],Tuple[Dict[int,Tuple[int,int]],Dict[int,Tuple[int,int]]]]={}
+        #{(t,step,s):(new, old)} with new={worker_id:(t,s)} and old={worker_id:(t,s)}
+        
     def initial_step(self,step: StepType=None):
         if step is None:
             step=self.param.index[1]
@@ -559,10 +620,16 @@ class  Server():
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta}
         self.param=step_func_dict[step](self.param,global_quantity_step)
         
-    def initialization(self,param0: Parameter):
-        
+    def initialization(self,param0: Parameter,params_path:str=None):
         #initialize the global parameter and the local quantities
-        params = [w.get_initial_param(param0) for w in self.workers]
+        if params_path: 
+            if os.path.exists(params_path):
+                with open(params_path, 'rb') as f:
+                    params = pickle.load(f)
+            else:
+                params = [w.get_initial_param(param0) for w in self.workers]
+                with open(params_path, 'wb') as f:
+                    pickle.dump(params, f)
         self.param =compute_average_param(params)
         self.param.index=(0,StepType.MU_SIGMA,0)
         self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
@@ -571,7 +638,6 @@ class  Server():
         sum_dict={key:sum(worker.compute_para_ind_local_quantity()[key] for worker in self.workers) for key in keys}
         global_para_ind_quantities={key: value / len(self.workers) for key, value in sum_dict.items()}
         global_para_ind_quantities['J']=len(self.workers)
-        global_para_ind_quantities['step_size']=0.4
         self.global_computation.set_global_para_ind_quantities(global_para_ind_quantities)
         
         #update mu and sigma
@@ -602,35 +668,61 @@ class  Server():
             # the condition is satisfied already
             local_quantities_by_step=self.local_quantities.get_by_step(step) 
             self.local_quantities.remove_by_step(step)
+            
         else:
             # if not, we should wait for the condition to be satisfied by get from local workers
-            time_min_index=None 
-            coming_times=np.empty(len(self.workers)) # the time needed for finishing the C&C for the upcoming parameter for all workers
+            #time_min_index=self.time_min_index
+            #coming_times=self.coming_times # the time needed for finishing the C&C for the upcoming parameter for all workers        
             while count_by_step<self.concurrency:
-                for i,w in enumerate(self.workers):
-                    if time_min_index is not None:
-                        if i==time_min_index:
-                            coming_times[i]=w.get_coming_time()
-                            w.set_cur_param()
-                        else:
-                            coming_times[i]=coming_times[i]-time_min
-                    else:
-                        coming_times[i]=w.get_coming_time()
-                        w.set_cur_param()
-                time_min_index=np.argmin(coming_times)
-                time_min=coming_times[time_min_index]
-                worker=self.workers[time_min_index]
-                LocalQuantity=worker.compute_dif_and_update_pre()
-                self.local_quantities.merge_new(LocalQuantity)
+                coming_times=torch.Tensor([worker.coming_time for worker in self.workers])
+                time_min_index:int=torch.argmin(coming_times)
+                LocalQuantity=self.workers[time_min_index].compute_dif_and_update_pre()
+                self.local_quantities.merge_new_dif(LocalQuantity)
                 count_by_step=self.local_quantities.get_count_by_step(step)
+
+                time_min:float=coming_times[time_min_index]
+                self.time=self.time+time_min
+                
+                for i  in range(len(self.workers)):
+                    if i==time_min_index:
+                        self.workers[i].set_cur_param()
+                        self.workers[i].coming_time=self.workers[i].get_refresh_coming_time()
+                    else:
+                        self.workers[i].coming_time=self.workers[i].coming_time-time_min
+                        
             local_quantities_by_step=self.local_quantities.get_by_step(step)
             self.local_quantities.remove_by_step(step)
+            
         return local_quantities_by_step
     
     
     
     def update_parameter_by_step(self,step:StepType):
         local_quantities_by_step=self.get_local_quantities_by_step(step)
+        # t=self.param.index[0]
+        # s=self.param.index[2]
+        
+        # self.recording_delay[(t,step,s)]=(dict(),dict()) 
+        #previous+local_quantities_by_step, if step is not theta, then previous is 
+        
+        
+        
+        #record the number of local quantities that the server used for each step
+        # num=len(local_quantities_by_step)
+        # #round=self.param.index[0]
+        # #self.num_local_quantities[round][step]=num
+        # logging.info(f"num_local_quantities:{num}")
+        # index_max=None
+        # round_itera_sum=0
+        # for work_id in local_quantities_by_step.keys():
+        #     local_quantity = local_quantities_by_step[work_id]
+        #     index=local_quantity.index
+        #     if index[0]+index[2]>round_itera_sum:
+        #         round_itera_sum=index[0]+index[2]
+        #         index_max=index
+        # logging.info(f"index_max:{index_max}")
+        
+        
         #take a summation of local_quantities_by_step, then get the global quantity
         step_keys_dict = {
             StepType.MU_SIGMA: ['mu', 'sigma'],
@@ -654,17 +746,20 @@ class  Server():
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta}
         self.param=step_func_dict[step](self.param,self.global_quantities[step])
          
+        
+         
     def broadcast_param(self,param):
         #broadcast the parameter to all the workers
         for worker in self.workers:
             worker.receive_param(param)
             
         
-    def run(self,param0: Parameter,T,S):
-        self.initialization(param0)
+    def run(self,param0: Parameter,T,S,local_params_path:str=None):
+        self.initialization(param0,local_params_path)
         self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
         for t in range(T):
-            print(f"iteration:{t}")
+            logging.info(f"iteration:{t}")
+            time_start=self.time
             # step MU_SIGMA
             self.update_parameter_by_step(StepType.MU_SIGMA) 
             self.param.index=(t+1,StepType.GAMMA,0)    
@@ -680,16 +775,33 @@ class  Server():
             # step THETA
             for s in range(S):
                 self.update_parameter_by_step(StepType.THETA)
-                print(f"theta:{self.param.theta.tolist()}")
+                logging.info(f"theta:{self.param.theta.tolist()}")
                 if s<S-1:
                     self.param.index=(t+1,StepType.THETA,s+1)  
                 else: 
                     self.param.index=(t+2,StepType.MU_SIGMA,0)
-                self.broadcast_param(self.param) 
+                self.broadcast_param(self.param)
+            
+            time_end=self.time
+            time_elapsed=time_end-time_start
+            #logging.info(f"time elapsed:{time_elapsed}")
+            self.times_elapsed.append(time_elapsed)
+            
+            #logging.info(f"theta:{self.param.theta.tolist()}")
             self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
             
     def save_params_GDT(self, filename: str):
         # Save self.params using pickle
         with open(filename, 'wb') as f:
             pickle.dump(self.params_GDT, f)
+
+
+class NonDisEstimation():
+    def  __init__(self,full_data:torch.Tensor,knots:torch.Tensor,\
+        kernel:Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]):
+        self.__computation=LocalComputation(full_data,knots,kernel)
+    def get_minimizer(self,param0:Parameter,tol=None):
+        param=self.__computation.get_local_minimizer(param0,tol)
+        return param
         
+    
