@@ -8,3 +8,4 @@ src/MPI/__pycache__
 .vscode
 *log.txt
 *.DS_Store
+experiments
