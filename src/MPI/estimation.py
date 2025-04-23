@@ -3,19 +3,27 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+print(f"NumPy is using {np.__config__.show()} for multithreading")
 from collections import deque,OrderedDict
 from typing import Deque,Dict,List,Tuple,Callable
 from enum import Enum
 import torch
+print(f"Using {torch.get_num_threads()} threads in PyTorch")
 from scipy.optimize import minimize
 from src.utils import softplus, inv_softplus
 from warnings import warn
 import math
+import random
 import pickle
 import psutil
 import logging
-import random
+from mpi4py import MPI
+from queue import Queue
+
+import threading
+from time import time
 from torch.autograd.functional import hessian
+import traceback
 #from torch.autograd import grad
 
 
@@ -125,9 +133,6 @@ def get_memory_usage():
     memory_info = process.memory_info()
     memory_usage_gb = memory_info.rss / 1024 ** 3  # Convert bytes to GB
     return memory_usage_gb
-
-
-
           
 class LocalComputation():
     # The class that implements the computation in local workers
@@ -647,7 +652,7 @@ class LocalComputation():
         param.mu=mu
         param.sigma=sigma
         return param
-    
+       
 class GlobalComputation():
     # The class that implements the computation in the server
     def __init__(self,knots:torch.Tensor,\
@@ -762,7 +767,7 @@ class GlobalComputation():
         # Construct the diagonal matrix of modified eigenvalues
         modified_eigenvalue_matrix = torch.diag(modified_eigenvalues)
         modified_hess = eigenvectors@modified_eigenvalue_matrix@eigenvectors.T
-        if self.step_size_theta<=0.1:
+        if self.step_size_theta<0.1:
             self.step_size_theta=self.step_size_theta*2        
         step_size=self.step_size_theta
         
@@ -836,15 +841,25 @@ class GlobalComputation():
 
 
 class Worker():
-    def __init__(self, worker_id:int, local_computation: LocalComputation, time_dict:Dict[StepType,float]):
-        self.worker_id = worker_id
-        self.time_dict = time_dict #the time needed for finishing the C&C for the upcoming parameter
+    def __init__(self,comm: MPI.Intracomm, server_rank:int, local_computation: LocalComputation,logger:logging.Logger):
+        self.comm=comm
+        self.rank=comm.Get_rank()
+        self.server_rank=server_rank
+        self.size=comm.Get_size()
+        self.worker_id=self.rank
         self.cur_param=None # used for computing local quantity
         self.update_param:Parameter=Parameter() # store the update param
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
         self.coming_time=None
         self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
         self.local_computation=local_computation
+        self.local_quantity=None
+        self.local_quantities:Deque[LocalQuantity]=deque()
+        self.logger=logger
+        self.condition_send=threading.Condition()
+        self.condition_receive=threading.Condition()
+        self.stop_flag = threading.Event()
+        
     def reset(self):
         self.cur_param=None
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
@@ -856,34 +871,25 @@ class Worker():
         self.pre_local_quantity_dict[step]=local_quantity
     
     def get_initial_param(self,param0: Parameter)->Parameter:
-        param = self.local_computation.get_local_minimizer(param0)
-        return param
+        
         try:
             param = self.local_computation.get_local_minimizer(param0)
+            
             return param
         except Exception as e:
-            logging.error(f"Error in get_initial_param for worker {self.worker_id} and the error message is: {e}")
+            logging.error(f"Error in get_initial_param: {e}")
             return None
         
-    def get_refresh_coming_time(self):
-        #the function that sets the C&C time for the upcoming parameter, which is just for simulation, in real world, it should be unknown until the C&C is finished
-        if self.cur_param: 
-            param=self.cur_param 
-            time=self.time_dict[param.index[1]] # maybe plus some random part and the seed should be fixed 
-        else:
-            time=np.inf
-        return time
-    def receive_param(self, param:Parameter):
+    
+    def set_local_params(self, param:Parameter):
         #when a new parameter is received, add it to the local parameters
-        id=None
-        
         for name in ['mu', 'sigma', 'gamma', 'delta', 'theta']:
             value = getattr(param, name)
             if value is not None:
                 setattr(self.update_param, name, value)
             else:
                 setattr(param, name, getattr(self.update_param, name))
-            
+        id=None
         if self.local_params is not None and len(self.local_params)>0:
             for i, local_param in enumerate(self.local_params):
                 if local_param.index[1]==param.index[1]:
@@ -892,16 +898,8 @@ class Worker():
             self.local_params.append(param)
         else:
             self.local_params[id]=param
-        #if the current parameter is None, set the current parameter as the first parameter in the deque
-        if self.cur_param is None:
-            self.set_cur_param() 
-            self.coming_time=self.get_refresh_coming_time()  
+        
             
-    def set_cur_param(self):
-        if self.local_params:
-            self.cur_param=self.local_params.popleft()
-        else:
-            self.cur_param=None
             
     def compute_local_quantity(self, param: Parameter,step: StepType=None)->LocalQuantity:
         if step is None:
@@ -923,7 +921,7 @@ class Worker():
             value=self.local_computation.compute_local_for_theta(param)
         elif step==StepType.DELTA_THETA:
             # compute local quantity for theta and delta
-            value=self.local_computation.compute_local_for_theta_delta(param)
+            value=self.local_computation.compute_local_for_theta_delta(param)    
         return LocalQuantity(self.worker_id, value, param.index)
     
     def compute_new_local_quantity(self)->LocalQuantity:
@@ -947,37 +945,133 @@ class Worker():
         dif_quantity=LocalQuantity(local_quantity.worker_id,dif_value,local_quantity.index)
         self.set_pre_local_quantity(local_quantity)
         return dif_quantity         
-        
+    
+    def initialization(self):
+        while True:
+            information=self.comm.bcast(None, root=self.server_rank)
+            if information['message']=='loc_opt':
+                param0=information['param0']
+                initial_param=self.get_initial_param(param0=param0)
+                self.comm.gather(initial_param,root=self.server_rank)
+            elif information['message']=='compute_para_ind_quantity':
+                para_ind_local_quantity=self.compute_para_ind_local_quantity()
+                self.comm.gather(para_ind_local_quantity,root=self.server_rank)
+            elif information['message']=='compute_local_quantity':
+                param=information['param']
+                step=information['step']
+                local_quantity=self.compute_local_quantity(param,step)
+                self.set_pre_local_quantity(local_quantity)
+                self.comm.gather(local_quantity,root=self.server_rank)
+            elif information['message']=='set_type_LR':
+                type_LR=information['type_LR']
+                self.local_computation.type_LR=type_LR
+                
+            elif information['message']=='stop':
+                param=information['param']
+                self.set_local_params(param=param)
+                break
+    
+    def send_local_quantity(self):
+        #the thread sending local quantity to the server
+        while not self.stop_flag.is_set():
+            with self.condition_send:
+                while len(self.local_quantities)==0:
+                    wait_result=self.condition_send.wait(timeout=300)
+                    if not wait_result:
+                        self.logger.info(f"Timeout waiting for send local quantity to server")
+                    if self.stop_flag.is_set():
+                        information={'message':'stop'}
+                        self.comm.send(information,dest=self.server_rank)
+                        return
+                local_quantity=self.local_quantities.popleft()
+            information={'message':'local_quantity','param':local_quantity}
+            self.comm.send(information,dest=self.server_rank)
+            self.logger.info(f"worker {self.worker_id} sends the local quantity {local_quantity.index}")
+                
+                
+    def compute_local_quantity_thread(self):
+        #the thread computing local quantity
+        while not self.stop_flag.is_set():
+            with self.condition_receive:
+                while len(self.local_params)==0:
+                    wait_result=self.condition_receive.wait(timeout=300)
+                    if not wait_result:
+                        self.logger.info(f"Timeout of worker {self.worker_id} waiting for receiving param from server")
+                    if self.stop_flag.is_set():  # Check again after waking up
+                        with self.condition_send:
+                            self.condition_send.notify()
+                            return 
+                self.cur_param=self.local_params.popleft()   
+            local_quantity=self.compute_dif_and_update_pre()
+            #sleep(1)
+            with self.condition_send:
+                self.local_quantities.append(local_quantity)
+                self.condition_send.notify()
+                
+    def receive_param(self):
+        #the thread receiving parameter from server
+        while not self.stop_flag.is_set():
+            information=self.comm.recv(source=self.server_rank)
+            if information['message']=='compute_local_quantity':
+                param=information['param']
+                with self.condition_receive:
+                    self.set_local_params(param)
+                    self.condition_receive.notify()
+            elif information['message']=='stop':
+                self.stop_flag.set()
+                with self.condition_receive:
+                    self.condition_receive.notify()
+                break
+    
+    
+    def start(self):
+        #start the worker
+        self.logger.info(f"worker {self.worker_id} starts initialization")
+        self.initialization()
+        send_thread=threading.Thread(target=self.send_local_quantity)
+        receive_thread=threading.Thread(target=self.receive_param)
+        compute_thread=threading.Thread(target=self.compute_local_quantity_thread)
+        send_thread.start()
+        receive_thread.start()
+        compute_thread.start()
+        send_thread.join()
+        receive_thread.join()
+        compute_thread.join()               
+     
 class  Server():
-    def __init__(self,workers:List[Worker],concurrency:int,global_computation:GlobalComputation,type_LR='F',dl_th_together=False):
+    def __init__(self,comm: MPI.Intracomm,concurrency:int,global_computation:GlobalComputation,logger: logging.Logger,theta_logger: logging.Logger,type_LR='F',dl_th_together=False):
         self.param:Parameter = None # The global parameter for the model
+        self.params:List[Parameter]=[]
         self.params_GDT:List[Parameter]=[] # The global parameters for the model
-        for w in workers:
-            w.reset()
-        self.workers=workers # The workers in the system
+        self.comm=comm
+        self.rank=comm.Get_rank()
+        self.size=comm.Get_size() # The number of workers+1 (server)
+        self.J=self.size-1 # The number of workers
+        #get the rank of local workers: from 0 to self.size, except self rank
+        self.worker_ranks = [rank for rank in range(self.size) if rank != self.rank]        
         self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
         self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
         self.concurrency=concurrency # The number of workers that are needed to compute the global quantities
         global_computation.reset()
         self.global_computation=global_computation
         
-        self.time:float=0 # record the accumulated time
-        self.times_elapsed:List[float]=[] # record the time for each iteration
+        
+        self.condition_receive=threading.Condition()
+        self.condition_send=threading.Condition()
+        self.params_index:Dict[int,int]={worker_rank:0 for worker_rank in self.worker_ranks}
+        self.stop_flag = threading.Event()
+        
+        self.logger=logger
+        self.theta_logger=theta_logger
         if type_LR in ['F', 'P', 'H']:
             self.type_LR=type_LR
             self.global_computation.type_LR=self.type_LR
-            for worker in self.workers:
-                worker.local_computation.type_LR=self.type_LR
         else:
             raise(ValueError("Invalid type_LR. Choose from 'F', 'P', or 'H'."))
         
         self.dl_th_together=dl_th_together # if True, the delta and theta are updated together, otherwise, they are updated separately
-        
-        #self.nums_local_quantities:Dict[int,Dict[StepType,int]]={} # record the number of local quantities that the server used for each step
-        #self.cur_num_local_quantities:Dict[StepType,int]={}
-        #self.recording_delay:Dict[Tuple[int,StepType,int],Tuple[Dict[int,Tuple[int,int]],Dict[int,Tuple[int,int]]]]={}
-        #{(t,step,s):(new, old)} with new={worker_id:(t,s)} and old={worker_id:(t,s)}
-        
+        self.choice_dict={}
+
     def initial_step(self,step: StepType=None):
         if step is None:
             step=self.param.index[1]
@@ -986,10 +1080,13 @@ class  Server():
         elif step!=self.param.index[1]:
             warn("the step is not consistent with the step in parameter", category=None, stacklevel=1)
         local_quantities_list = []
-        for w in self.workers:
-            local_quantity = w.compute_local_quantity(self.param, step)
-            w.set_pre_local_quantity(local_quantity)
-            local_quantities_list.append(local_quantity)
+        
+        
+        self.comm.bcast({"message":"compute_local_quantity","param":self.param,"step":step}, root=self.rank)
+        local_quantity=None
+        gathered_local_quantities=self.comm.gather(local_quantity, root=self.rank)
+        local_quantities_list=[local_quantity for local_quantity in gathered_local_quantities if local_quantity is not None]
+        
 
         local_quantities = LocalQuantities(local_quantities_list)
         local_quantities_step = local_quantities.get_by_step(step)
@@ -998,8 +1095,9 @@ class  Server():
             step_keys_dict[StepType.GAMMA].append('XX')
             if not self.dl_th_together:
                 step_keys_dict[StepType.DELTA].append('tr_inv')
-            
-        sum_dict = {key: sum(lq.value[key] for lq in local_quantities_step.values()) for key in step_keys_dict[step]}
+                
+        sum_dict = {key: sum(lq.value[key] for lq in local_quantities_step.values()) 
+                    for key in step_keys_dict[step]}
         n = len(local_quantities_step)
         global_quantity_step = {key: value / n for key, value in sum_dict.items()}
         self.global_quantities[step]=global_quantity_step
@@ -1009,15 +1107,25 @@ class  Server():
         
     def initialization(self,param0: Parameter,params_path:str=None):
         #initialize the global parameter and the local quantities
-        if params_path: 
-            if os.path.exists(params_path):
-                with open(params_path, 'rb') as f:
-                    params = pickle.load(f)
-            else:
-                #param=self.workers[0].get_initial_param(param0)
-                params = [w.get_initial_param(param0) for w in self.workers]
+        
+        information={'type_LR':self.type_LR,'message':'set_type_LR'}
+        self.comm.bcast(information, root=self.rank)
+        
+        if params_path and os.path.exists(params_path):
+            with open(params_path, 'rb') as f:
+                params = pickle.load(f)
+        else:       
+            #send param0
+            information={'param0':param0,'message':'loc_opt'}
+            self.comm.bcast(information, root=self.rank)
+            initial_param=None
+            gathered_initial_params=self.comm.gather(initial_param, root=self.rank)
+            params=[initial_param for initial_param in gathered_initial_params if initial_param is not None]
+            #save the resutls
+            if params_path:
                 with open(params_path, 'wb') as f:
                     pickle.dump(params, f)
+            
         self.param =compute_average_param(params)
         self.param.index=(0,StepType.MU_SIGMA,0)
         self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
@@ -1025,11 +1133,17 @@ class  Server():
         if self.type_LR=='F':
             keys={'XX','Xz','n'} #n is the average local sample size
         elif self.type_LR=='P' or self.type_LR=='H':
-            keys={'n'}
-        sum_dict={key:sum(worker.compute_para_ind_local_quantity()[key] for worker in self.workers) for key in keys}
-        global_para_ind_quantities={key: value / len(self.workers) for key, value in sum_dict.items()}
-        global_para_ind_quantities['J']=len(self.workers)
+            keys={'n'} #n is the average local sample size
+        para_ind_quantity=None
+        information={'message':'compute_para_ind_quantity'}
+        self.comm.bcast(information, root=self.rank)
+        gathered_para_ind_quantities=self.comm.gather(para_ind_quantity, root=self.rank)
+        gathered_para_ind_quantities=[para_ind_quantity for para_ind_quantity in gathered_para_ind_quantities if para_ind_quantity is not None]
+        sum_dict={key:sum(para_ind_quantity[key] for para_ind_quantity in gathered_para_ind_quantities) for key in keys}
+        global_para_ind_quantities={key: value / self.J for key, value in sum_dict.items()}
+        global_para_ind_quantities['J']=self.J
         self.global_computation.set_global_para_ind_quantities(global_para_ind_quantities)
+        
         #update mu and sigma
         self.initial_step(StepType.MU_SIGMA)
         self.param.index=(0,StepType.GAMMA,0) 
@@ -1037,13 +1151,10 @@ class  Server():
         self.initial_step(StepType.GAMMA)
         if self.dl_th_together:
             self.param.index=(0,StepType.DELTA_THETA,0)
-            #update delta and theta
             S=5
             for s in range(S):
                 self.initial_step(StepType.DELTA_THETA)
                 self.param.index=(0,StepType.DELTA_THETA,s+1)
-            self.param.index=(1,StepType.MU_SIGMA,0)
-            self.broadcast_param(self.param)
         else:
             self.param.index=(0,StepType.DELTA,0)
             #update delta
@@ -1054,77 +1165,22 @@ class  Server():
             for s in range(S):
                 self.initial_step(StepType.THETA)
                 self.param.index=(0,StepType.THETA,s+1)
-            self.param.index=(1,StepType.MU_SIGMA,0)
-            self.broadcast_param(self.param)
-        
-        
-          
-    def get_local_quantities_by_step(self,step:StepType):
-        #update the global parameter by the local quantities
-        #Find the corresponding local quantities that stored in local_quantities, if there aren't any or the number is not enough, wait for the until the condition is satisfied
-        count_by_step=self.local_quantities.get_count_by_step(step)
-        
-        if count_by_step>=self.concurrency:
-            # the condition is satisfied already
-            local_quantities_by_step=self.local_quantities.get_by_step(step) 
-            self.local_quantities.remove_by_step(step)
-            
-        else:
-            # if not, we should wait for the condition to be satisfied by get from local workers
-            #time_min_index=self.time_min_index
-            #coming_times=self.coming_times # the time needed for finishing the C&C for the upcoming parameter for all workers        
-            while count_by_step<self.concurrency:
-                coming_times=torch.Tensor([worker.coming_time for worker in self.workers])
-                time_min_index:int=torch.argmin(coming_times)
-                LocalQuantity=self.workers[time_min_index].compute_dif_and_update_pre()
-                self.local_quantities.merge_new_dif(LocalQuantity)
-                count_by_step=self.local_quantities.get_count_by_step(step)
-
-                time_min:float=coming_times[time_min_index]
-                self.time=self.time+time_min
                 
-                for i  in range(len(self.workers)):
-                    if i==time_min_index:
-                        self.workers[i].set_cur_param()
-                        self.workers[i].coming_time=self.workers[i].get_refresh_coming_time()
-                    else:
-                        self.workers[i].coming_time=self.workers[i].coming_time-time_min
-                        
-            local_quantities_by_step=self.local_quantities.get_by_step(step)
-            self.local_quantities.remove_by_step(step)
-            
-        return local_quantities_by_step
-    
+        self.param.index=(1,StepType.MU_SIGMA,0)
+        self.comm.bcast({"message":"stop","param":self.param}, root=self.rank)
+        
     
     
     def update_parameter_by_step(self,step:StepType):
-        local_quantities_by_step=self.get_local_quantities_by_step(step)
-        # t=self.param.index[0]
-        # s=self.param.index[2]
-        
-        # self.recording_delay[(t,step,s)]=(dict(),dict()) 
-        #previous+local_quantities_by_step, if step is not theta, then previous is 
-        
-        
-        
-        #record the number of local quantities that the server used for each step
-        # num=len(local_quantities_by_step)
-        # #round=self.param.index[0]
-        # #self.num_local_quantities[round][step]=num
-        # logging.info(f"num_local_quantities:{num}")
-        # index_max=None
-        # round_itera_sum=0
-        # for work_id in local_quantities_by_step.keys():
-        #     local_quantity = local_quantities_by_step[work_id]
-        #     index=local_quantity.index
-        #     if index[0]+index[2]>round_itera_sum:
-        #         round_itera_sum=index[0]+index[2]
-        #         index_max=index
-        # logging.info(f"index_max:{index_max}")
-        
-        
+        with self.condition_receive:
+            while self.local_quantities.get_count_by_step(step)<self.concurrency:
+                wait_result = self.condition_receive.wait(timeout=300)  # 5 minutes timeout
+                if not wait_result:
+                    raise(f"Timeout waiting for waiting local quantities for step {step}")
+            self.logger.info(f"server already receives {self.local_quantities.get_count_by_step(step)} local quantities for step {step} for updating parameter")
+            local_quantities_by_step=self.local_quantities.get_by_step(step)
+            self.local_quantities.remove_by_step(step)        
         #take a summation of local_quantities_by_step, then get the global quantity
-        
         step_keys_dict = {
             StepType.MU_SIGMA: ['mu', 'sigma'],
             StepType.GAMMA: ['gamma'],
@@ -1146,91 +1202,157 @@ class  Server():
             local_quantity = local_quantities_by_step[work_id]
             for key in step_keys_dict[step]:
                 sum_dict[key] += local_quantity.value[key]
-        J=len(self.workers)
         
         for key in step_keys_dict[step]:
-            self.global_quantities[step][key]=self.global_quantities[step][key]+sum_dict[key]/J 
+            self.global_quantities[step][key]=self.global_quantities[step][key]+sum_dict[key]/self.J 
         
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta,StepType.DELTA_THETA:self.global_computation.update_delta_theta}
         self.param=step_func_dict[step](self.param,self.global_quantities[step])
-         
         
-         
-    def broadcast_param(self,param,choices=None):
-        #broadcast the parameter to the workers in the choices if it is not None
-        if choices is not None:
-            for c in choices:
-                worker:Worker=self.workers[c]
-                worker.receive_param(param)
-        else:
-            for worker in self.workers:
-                worker.receive_param(param)
-            
         
-    def run(self,param0: Parameter,T,S,local_params_path:str=None,ratio=1):
-        #ratio is the sampling ratio local workers
-        self.initialization(param0,local_params_path)
-        self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
+   
+    def receive_local_quantity(self):
+        while not self.stop_flag.is_set():
+            information=self.comm.recv(source=MPI.ANY_SOURCE)
+            if information['message']=='local_quantity':
+                local_quantity:LocalQuantity=information['param']
+            else: #other message from the worker
+                return
+            self.logger.info(f"server receives the local quantity {local_quantity.index}")
+            with self.condition_receive:
+                self.local_quantities.merge_new_dif(local_quantity)
+                self.condition_receive.notify()
+    
+    def send_param_to_worker(self,worker_rank):
+            while not self.stop_flag.is_set():
+                with self.condition_send:
+                    index=self.params_index[worker_rank]
+                    while index>=len(self.params):
+                        # wait for new param to be added, then check if the number is sufficient
+                        wait_result=self.condition_send.wait(timeout=300)  # 5 minutes timeout
+                        if not wait_result:
+                            self.logger.info(f"Timeout waiting for send param to worker {worker_rank}")
+                        if self.stop_flag.is_set():  # Check again after waking up
+                            information={'message':'stop'}
+                            self.comm.send(information,dest=worker_rank)
+                            return 
+                    param=self.params[index]
+                    information={'message':'compute_local_quantity','param':param}
+                    # this should be put inside self.condition_send since other othread can modify it
+                    self.params_index[worker_rank]=index+1
+                t=param.index[0]
+                choice=self.choice_dict[t]
+                if worker_rank in choice:
+                    self.comm.send(information,dest=worker_rank) 
+                    self.logger.info(f"server sends the parameter {param.index} to worker {worker_rank}")  
+            information={'message':'stop'}
+            self.comm.send(information,dest=worker_rank)
+    def update_parameter(self,T,S,ratio=1):
+        start_time = time()
+        times_elapsed = []
         for t in range(T):
-            choices=random.sample(range(len(self.workers)), int(ratio*len(self.workers)))
+            choice=random.sample(self.worker_ranks, int(ratio*len(self.worker_ranks)))
             #sort choices
-            choices.sort()
-            
-            logging.info(f"iteration:{t}")
-            time_start=self.time
+            choice.sort()
+            self.choice_dict[t+1]=choice
+            self.logger.info(f"iteration:{t}")
+            self.theta_logger.info(f"iteration:{t}")
             # step MU_SIGMA
             self.update_parameter_by_step(StepType.MU_SIGMA) 
-            self.param.index=(t+1,StepType.GAMMA,0)  
-            param=Parameter(mu=self.param.mu,sigma=self.param.sigma,index=self.param.index) # just broadcast the updated parts
-            self.broadcast_param(param,choices=choices)      
+            self.param.index=(t+1,StepType.GAMMA,0) 
+            param=Parameter(mu=self.param.mu,sigma=self.param.sigma,index=self.param.index) 
+            with self.condition_send:
+                self.params.append(param)
+                self.condition_send.notify_all()
             # step GAMMA
             self.update_parameter_by_step(StepType.GAMMA)
+            
             if self.dl_th_together:
                 self.param.index=(t+1,StepType.DELTA_THETA,0)
-                param=Parameter(gamma=self.param.gamma,index=self.param.index) # just broadcast the updated parts
-                self.broadcast_param(self.param,choices=choices) 
+                param=Parameter(gamma=self.param.gamma,index=self.param.index)
+                with self.condition_send:
+                    self.params.append(param)
+                    self.condition_send.notify_all()
+                # step DELTA_THETA
                 for s in range(S):
                     self.update_parameter_by_step(StepType.DELTA_THETA)
-                    logging.info(f"theta:{self.param.theta.tolist()}")
+                    self.logger.info(f"theta:{self.param.theta.tolist()}")
+                    self.theta_logger.info(f"theta:{self.param.theta.tolist()}")
                     if s<S-1:
-                        self.param.index=(t+1,StepType.DELTA_THETA,s+1)     
+                        self.param.index=(t+1,StepType.DELTA_THETA,s+1)  
                     else: 
                         self.param.index=(t+2,StepType.MU_SIGMA,0)
-                    param=Parameter(delta=self.param.delta,theta=self.param.theta,index=self.param.index) # just broadcast the updated parts   
-                    self.broadcast_param(self.param,choices=choices)
+                    param=Parameter(delta=self.param.delta,theta=self.param.theta,index=self.param.index)
+                    with self.condition_send:
+                        self.params.append(param)
+                        self.condition_send.notify_all()
             else:
                 self.param.index=(t+1,StepType.DELTA,0)
-                param=Parameter(gamma=self.param.gamma,index=self.param.index) # just broadcast the updated parts
-                self.broadcast_param(self.param,choices=choices) 
+                param=Parameter(gamma=self.param.gamma,index=self.param.index)
+                with self.condition_send:
+                    self.params.append(param)
+                    self.condition_send.notify_all()
                 # step DELTA
                 self.update_parameter_by_step(StepType.DELTA)
                 self.param.index=(t+1,StepType.THETA,0)
-                param=Parameter(delta=self.param.delta,index=self.param.index) # just broadcast the updated parts
-                #logging.info(f"delta:{self.param.delta.tolist()}")
-                self.broadcast_param(self.param,choices=choices) 
-                #step THETA
+                param=Parameter(delta=self.param.delta,index=self.param.index)
+                with self.condition_send:
+                    self.params.append(self.param)
+                    self.condition_send.notify_all()
+                # step THETA
                 for s in range(S):
                     self.update_parameter_by_step(StepType.THETA)
-                    logging.info(f"theta:{self.param.theta.tolist()}")
+                    self.logger.info(f"theta:{self.param.theta.tolist()}")
+                    self.theta_logger.info(f"theta:{self.param.theta.tolist()}")
                     if s<S-1:
-                        self.param.index=(t+1,StepType.THETA,s+1)     
+                        self.param.index=(t+1,StepType.THETA,s+1)  
                     else: 
                         self.param.index=(t+2,StepType.MU_SIGMA,0)
                     param=Parameter(theta=self.param.theta,index=self.param.index) # just broadcast the updated parts   
-                    self.broadcast_param(self.param,choices=choices)
-            
-            time_end=self.time
-            time_elapsed=time_end-time_start
-            #logging.info(f"time elapsed:{time_elapsed}")
-            self.times_elapsed.append(time_elapsed)
-            
-            #logging.info(f"theta:{self.param.theta.tolist()}")
+                    with self.condition_send:
+                        self.params.append(param)
+                        self.condition_send.notify_all()
+            times_elapsed.append(time() - start_time)
             self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
+        
+        self.times_elapsed = times_elapsed
+            
+        self.stop_flag.set() 
+        with self.condition_send:
+            self.condition_send.notify_all()
+          
+    def start(self,param0: Parameter,T,S,local_params_path:str=None,ratio=1):
+        try:
+            self.logger.info('Server starts initialization')
+            self.initialization(param0,local_params_path)
+            self.logger.info('Server finishes initialization')
+            receive_thread=threading.Thread(target=self.receive_local_quantity)
+            update_thread=threading.Thread(target=self.update_parameter,args=(T,S,ratio))
+            send_threads:List[threading.Thread]=[]
+            for work_rank in self.worker_ranks:
+                send_thread=threading.Thread(target=self.send_param_to_worker,args=(work_rank,))
+                send_threads.append(send_thread)
+            receive_thread.start()  
+            update_thread.start()
+            for send_thread in send_threads:
+                send_thread.start()
+            receive_thread.join()
+            update_thread.join()
+            for send_thread in send_threads:
+                send_thread.join()
+        except Exception as e:
+            logging.error(f"Error in server execution: {e}")
+            logging.error("Detailed traceback:\n" + traceback.format_exc())
+            self.stop_flag.set()  
             
     def save_params_GDT(self, filename: str):
         # Save self.params using pickle
         with open(filename, 'wb') as f:
             pickle.dump(self.params_GDT, f)
+    def save_times_elapsed(self, filename: str):
+        # Save self.params using pickle
+        with open(filename, 'wb') as f:
+            pickle.dump(self.times_elapsed, f)
 
 
 class NonDisEstimation():
@@ -1240,3 +1362,5 @@ class NonDisEstimation():
     def get_minimizer(self,param0:Parameter,tol=None):
         param=self.__computation.get_local_minimizer(param0,tol)
         return param
+        
+    

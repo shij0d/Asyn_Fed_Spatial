@@ -2,3 +2,9 @@ data
 results
 src/__pycache__
 experiments/__pycache__
+src/MPI/__pycache__
+*.out
+*.err
+.vscode
+*log.txt
+*.DS_Store
