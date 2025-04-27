@@ -529,7 +529,7 @@ class GPPSampleGeneratorUnitSquare:
         res=[]
         for i in range(n_samples):
             data = torch.hstack((locations,z[i].reshape(-1,1),X[i]))
-            tup=(data,knots)
+            tup=(data,knots[i])
             res.append(tup)
         return res
     def data_split(self,data:torch.Tensor,J:int,method:str='random',neighbours:int=None)->List[torch.Tensor]:

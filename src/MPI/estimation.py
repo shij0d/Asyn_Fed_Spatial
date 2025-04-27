@@ -177,7 +177,7 @@ class LocalComputation():
     def local_errorv(self,gamma)->torch.Tensor:
         local_X = self.local_data[:, 3:]
         local_z = self.local_data[:, 2].unsqueeze(1)
-        local_errorv = local_X@gamma-local_z
+        local_errorv = local_X@gamma-local_z        
         return local_errorv
     
     def local_XX(self)->torch.Tensor:
@@ -442,7 +442,7 @@ class LocalComputation():
         grad = torch.autograd.grad(f_value, theta, create_graph=True)[0]  # Retain graph for Hessian
         
         # Initialize Hessian
-        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float64)
+        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float32)
 
         # Compute Hessian row-by-row
         for i in range(theta.numel()):
@@ -537,7 +537,7 @@ class LocalComputation():
         return param
     def __Parameter2FreeVector_GDT(self, param: Parameter) -> torch.Tensor:
         p=param.gamma.shape[0]
-        free_vector_GDT = torch.empty(p+1+param.theta.shape[0], dtype=torch.float64)
+        free_vector_GDT = torch.empty(p+1+param.theta.shape[0], dtype=torch.float32)
 
         start = 0
         if p > 0:
@@ -607,12 +607,12 @@ class LocalComputation():
         """
         if requires_grad:
             def fun(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
                 value = self.local_neg_log_lik(free_vector_GDT, False)
                 return value.numpy().flatten()
 
             def gradf(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
                 _, grad = self.local_neg_log_lik(free_vector_GDT, True)
                 return grad.numpy()
 
@@ -620,7 +620,7 @@ class LocalComputation():
         
         else:
             def fun(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
                 value = self.local_neg_log_lik(free_vector_GDT, False)
                 return value.numpy().flatten()
             return fun
@@ -640,7 +640,7 @@ class LocalComputation():
                             x0=free_vector_GDT0,
                             method="BFGS",
                             jac=nllikgf)
-        minimizer_lik = torch.tensor(result.x, dtype=torch.float64)
+        minimizer_lik = torch.tensor(result.x, dtype=torch.float32)
         param= self.__FreeVector2Parameter_GDT(minimizer_lik)
         param.index=(-1,StepType.MU_SIGMA,0) # the index is set to -1,0,0, which means that it is not used in the computation
         local_for_mu_sigma=self.compute_local_for_mu_sigma(param)
@@ -688,7 +688,7 @@ class GlobalComputation():
             torch.trace(invK @ sigma) + torch.logdet(K)
         f_value.backward(create_graph=True)
         grad = theta.grad.clone()
-        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float64)
+        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float32)
         for i in range(theta.numel()):
             g2 = torch.autograd.grad(
                 grad[i], 
@@ -1212,17 +1212,29 @@ class  Server():
         
         
    
-    def receive_local_quantity(self):
+    # def receive_local_quantity(self):
+    #     while not self.stop_flag.is_set():
+    #         information=self.comm.recv(source=MPI.ANY_SOURCE)
+    #         if information['message']=='local_quantity':
+    #             local_quantity:LocalQuantity=information['param']
+    #         else: #other message from the worker
+    #             return
+    #         self.logger.info(f"server receives the local quantity {local_quantity.index}")
+    #         with self.condition_receive:
+    #             self.local_quantities.merge_new_dif(local_quantity)
+    #             self.condition_receive.notify()
+                
+    def receive_local_quantity_from_worker(self,worker_rank):
         while not self.stop_flag.is_set():
-            information=self.comm.recv(source=MPI.ANY_SOURCE)
+            information=self.comm.recv(source=worker_rank)
             if information['message']=='local_quantity':
                 local_quantity:LocalQuantity=information['param']
             else: #other message from the worker
                 return
-            self.logger.info(f"server receives the local quantity {local_quantity.index}")
+            #self.logger.info(f"server receives the local quantity {local_quantity.index}")
             with self.condition_receive:
                 self.local_quantities.merge_new_dif(local_quantity)
-                self.condition_receive.notify()
+                self.condition_receive.notify_all()
     
     def send_param_to_worker(self,worker_rank):
             while not self.stop_flag.is_set():
@@ -1245,7 +1257,7 @@ class  Server():
                 choice=self.choice_dict[t]
                 if worker_rank in choice:
                     self.comm.send(information,dest=worker_rank) 
-                    self.logger.info(f"server sends the parameter {param.index} to worker {worker_rank}")  
+                    #self.logger.info(f"server sends the parameter {param.index} to worker {worker_rank}")  
             information={'message':'stop'}
             self.comm.send(information,dest=worker_rank)
     def update_parameter(self,T,S,ratio=1):
@@ -1327,17 +1339,24 @@ class  Server():
             self.logger.info('Server starts initialization')
             self.initialization(param0,local_params_path)
             self.logger.info('Server finishes initialization')
-            receive_thread=threading.Thread(target=self.receive_local_quantity)
+            #receive_thread=threading.Thread(target=self.receive_local_quantity)
+            receive_threads:List[threading.Thread]=[]
+            for work_rank in self.worker_ranks:
+                receive_thread=threading.Thread(target=self.receive_local_quantity_from_worker,args=(work_rank,))
+                receive_threads.append(receive_thread)
             update_thread=threading.Thread(target=self.update_parameter,args=(T,S,ratio))
             send_threads:List[threading.Thread]=[]
             for work_rank in self.worker_ranks:
                 send_thread=threading.Thread(target=self.send_param_to_worker,args=(work_rank,))
                 send_threads.append(send_thread)
-            receive_thread.start()  
+            for receive_thread in receive_threads:
+                receive_thread.start()
             update_thread.start()
             for send_thread in send_threads:
                 send_thread.start()
-            receive_thread.join()
+            
+            for receive_thread in receive_threads:
+                receive_thread.join()
             update_thread.join()
             for send_thread in send_threads:
                 send_thread.join()
