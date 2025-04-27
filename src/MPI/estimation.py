@@ -311,6 +311,7 @@ class LocalComputation():
             value['gamma']=local_for_gamma
         elif self.type_LR=='P':
             delta=para.delta
+            local_z = self.local_data[:, 2].unsqueeze(1)
             local_inv=self.local_inv_with_IM_quantity(theta,delta,t)
             #local_inv=self.local_inv(theta,delta)
             local_for_gamma=local_X.T@local_inv@(local_z-local_B@mu)
