@@ -510,15 +510,18 @@ class GPPSampleGeneratorUnitSquare:
         else:  
             raise("Invalid choice. Please select from 'random' or 'grid'.")
         # Compute the covariance matrix using the kernel function
-        cov = self.kernel(locations)
-        cov=torch.tensor(cov,dtype=torch.float32)
-        # Initialize the mean vector as zeros
-        mean = torch.zeros(self.num)
+        cov = self.kernel(locations,locations)
+        # Convert the covariance matrix to a PyTorch tensor
+        if not isinstance(cov, torch.Tensor):
+            cov = torch.tensor(cov, dtype=torch.float32)  # Convert to tensor
+        elif cov.dtype != torch.float32:
+            cov = cov.to(torch.float32)
+
 
         # Generate random samples (y) from a multivariate normal distribution
         L = torch.linalg.cholesky(cov)
-        z_normal = torch.randn(n_samples, mean.numel())
-        y=z_normal @ L.T + mean
+        z_normal = torch.randn(n_samples, cov.shape[0], dtype=torch.float32)
+        y=z_normal @ L.T 
         
         # Generate observations based on linear model: z = X @ coefficients + y + epsilon
         value,X=self.generate_x_epsilon(n_samples)
