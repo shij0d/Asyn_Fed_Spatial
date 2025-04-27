@@ -395,12 +395,12 @@ class GPPSampleGeneratorUnitSquare:
         # Step 1: Create grid from 1 to n_sqrt
         n_sqrt=math.ceil(math.sqrt(self.num))
         n=n_sqrt**2
-        xs=torch.arange(1, n_sqrt+1)
-        ys=torch.arange(1, n_sqrt+1)
+        xs=torch.arange(1, n_sqrt+1,dtype=torch.float64)
+        ys=torch.arange(1, n_sqrt+1,dtype=torch.float64)
         xx,yy=torch.meshgrid(xs,ys,indexing='ij')
         grid_points = torch.column_stack([xx.ravel(), yy.ravel()]) # shape: (n, 2)
         # Step 2: Add uniform jitter in [-0.4, 0.4]
-        jitter = torch.empty(n, 2).uniform_(-0.4, 0.4)
+        jitter = torch.empty(n, 2, dtype=torch.float64).uniform_(-0.4, 0.4)
         
         # Step 3: Apply transformation (grid - 0.5 + jitter) / nx
         jittered_points = (grid_points - 0.5 + jitter) / n_sqrt
@@ -478,14 +478,14 @@ class GPPSampleGeneratorUnitSquare:
 
         # Generate design matrix X with normal distribution
         torch.manual_seed(self.seed)
-        X = torch.normal(mean=0, std=1, size=(n_samples,self.num, p))
+        X = torch.normal(mean=0, std=1, size=(n_samples,self.num, p),dtype=torch.float64)
        
 
         # Generate noise term epsilon with normal distribution
-        epsilon= torch.normal(mean=0, std=self.noise_level, size=(n_samples,self.num,1))
+        epsilon= torch.normal(mean=0, std=self.noise_level, size=(n_samples,self.num,1),dtype=torch.float64)
         
         # Convert coefficients to torch tensor for matrix multiplication
-        coefficients_array = torch.tensor(self.coefficients,dtype=torch.float32).reshape(p, 1)
+        coefficients_array = torch.tensor(self.coefficients,dtype=torch.float64).reshape(p, 1)
 
         value= X @ coefficients_array + epsilon
         
@@ -513,14 +513,14 @@ class GPPSampleGeneratorUnitSquare:
         cov = self.kernel(locations,locations)
         # Convert the covariance matrix to a PyTorch tensor
         if not isinstance(cov, torch.Tensor):
-            cov = torch.tensor(cov, dtype=torch.float32)  # Convert to tensor
-        elif cov.dtype != torch.float32:
-            cov = cov.to(torch.float32)
+            cov = torch.tensor(cov, dtype=torch.float64)  # Convert to tensor
+        elif cov.dtype != torch.float64:
+            cov = cov.to(torch.float64)
 
 
         # Generate random samples (y) from a multivariate normal distribution
         L = torch.linalg.cholesky(cov)
-        z_normal = torch.randn(n_samples, cov.shape[0], dtype=torch.float32)
+        z_normal = torch.randn(n_samples, cov.shape[0], dtype=torch.float64)
         y=z_normal @ L.T 
         
         # Generate observations based on linear model: z = X @ coefficients + y + epsilon

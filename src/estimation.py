@@ -436,7 +436,7 @@ class LocalComputation():
         grad = torch.autograd.grad(f_value, theta, create_graph=True)[0]  # Retain graph for Hessian
         
         # Initialize Hessian
-        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float32)
+        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float64)
 
         # Compute Hessian row-by-row
         for i in range(theta.numel()):
@@ -531,7 +531,7 @@ class LocalComputation():
         return param
     def __Parameter2FreeVector_GDT(self, param: Parameter) -> torch.Tensor:
         p=param.gamma.shape[0]
-        free_vector_GDT = torch.empty(p+1+param.theta.shape[0], dtype=torch.float32)
+        free_vector_GDT = torch.empty(p+1+param.theta.shape[0], dtype=torch.float64)
 
         start = 0
         if p > 0:
@@ -601,12 +601,12 @@ class LocalComputation():
         """
         if requires_grad:
             def fun(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
                 value = self.local_neg_log_lik(free_vector_GDT, False)
                 return value.numpy().flatten()
 
             def gradf(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
                 _, grad = self.local_neg_log_lik(free_vector_GDT, True)
                 return grad.numpy()
 
@@ -614,7 +614,7 @@ class LocalComputation():
         
         else:
             def fun(free_vector_GDT: np.ndarray):
-                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float32)
+                free_vector_GDT = torch.tensor(free_vector_GDT, dtype=torch.float64)
                 value = self.local_neg_log_lik(free_vector_GDT, False)
                 return value.numpy().flatten()
             return fun
@@ -634,7 +634,7 @@ class LocalComputation():
                             x0=free_vector_GDT0,
                             method="BFGS",
                             jac=nllikgf)
-        minimizer_lik = torch.tensor(result.x, dtype=torch.float32)
+        minimizer_lik = torch.tensor(result.x, dtype=torch.float64)
         param= self.__FreeVector2Parameter_GDT(minimizer_lik)
         param.index=(-1,StepType.MU_SIGMA,0) # the index is set to -1,0,0, which means that it is not used in the computation
         local_for_mu_sigma=self.compute_local_for_mu_sigma(param)
@@ -682,7 +682,7 @@ class GlobalComputation():
             torch.trace(invK @ sigma) + torch.logdet(K)
         f_value.backward(create_graph=True)
         grad = theta.grad.clone()
-        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float32)
+        hessian = torch.zeros((theta.numel(), theta.numel()), dtype=torch.float64)
         for i in range(theta.numel()):
             g2 = torch.autograd.grad(
                 grad[i], 
