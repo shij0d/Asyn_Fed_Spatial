@@ -7,8 +7,11 @@ import numpy as np
 import random
 import math
 from scipy.spatial.distance import cdist
+import matplotlib
+matplotlib.use('Agg')  # Use the 'Agg' backend for non-GUI plotting
 import matplotlib.pyplot as plt
 from typing import Tuple,List
+import torch
 #a large number
 M=10*8
 
@@ -381,73 +384,89 @@ class GPPSampleGeneratorUnitSquare:
         self.noise_level=noise_level
         self.coefficients=coefficients
         self.seed=seed
-    def random_points(self) -> np.ndarray:
+    def random_points(self) -> torch.Tensor:
         """
         Generates a list of random spatial location points, 
 
         Returns:
         - list: A list of tuples, each representing a random point (x, y).
         """
-        np.random.seed(self.seed)
-        
+        torch.manual_seed(self.seed)
         # Step 1: Create grid from 1 to n_sqrt
         n_sqrt=math.ceil(math.sqrt(self.num))
         n=n_sqrt**2
-        xs= np.arange(1, n_sqrt+1)
-        ys=np.arange(1, n_sqrt+1)
-        xx,yy=np.meshgrid(xs,ys)
-        grid_points = np.column_stack([xx.ravel(), yy.ravel()]) # shape: (n, 2)
+        xs=torch.arange(1, n_sqrt+1)
+        ys=torch.arange(1, n_sqrt+1)
+        xx,yy=torch.meshgrid(xs,ys,indexing='ij')
+        grid_points = torch.column_stack([xx.ravel(), yy.ravel()]) # shape: (n, 2)
         # Step 2: Add uniform jitter in [-0.4, 0.4]
-        jitter = np.random.uniform(-0.4, 0.4, size=(n, 2))
+        jitter = torch.empty(n, 2).uniform_(-0.4, 0.4)
         
         # Step 3: Apply transformation (grid - 0.5 + jitter) / nx
         jittered_points = (grid_points - 0.5 + jitter) / n_sqrt
-        
         #Step 4: Randomly sample num points from the jittered points
-        indices = np.random.choice(n, size=self.num, replace=False)
+        indices = torch.randperm(n)[:self.num]
         sampled_points = jittered_points[indices]
         return sampled_points
+
     
-    def get_knots_random(self, locations:np.ndarray, m:int)->np.ndarray:
+    def get_knots_random(self, locations:torch.Tensor, m:int,n_samples=1)->torch.Tensor:
         """
         Randomly selects m knot points from given locations.
 
         Parameters:
-        - locations (np.ndarray): locations.
+        - locations (torch.Tensor): locations.
         - m (int): Number of knot points to select.
 
         Returns:
-        - np.ndarray: randomly selected knot points.
+        - torch.Tensor: randomly selected knot points.
         """
-        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)  # for reproducibility
         n = locations.shape[0]
-        # Randomly sample m indices from the range of n
-        indices = np.random.choice(n, size=m, replace=False)
-        knots=locations[indices]
-        return knots        
-    def get_knots_grid(self, m:int)->np.ndarray:
+
+        # Use a list comprehension to generate n_samples of m knots each
+        knots_list = [locations[torch.randperm(n)[:m]] for _ in range(n_samples)]
+
+        # stack them into a single tensor of shape (n_samples, m, location_dim)
+        knots_tensor = torch.stack(knots_list)
+
+        return knots_tensor
+           
+    def get_knots_grid(self, m:int,n_samples=1)->torch.Tensor:
         """
         Generates knot points on a grid within the unit square.
         Parameters:
         - m (int): Number of knot points to generate.
         Returns:
-        - np.ndarray: Grid-generated knot points.
+        - torch.Tensor: Grid-generated knot points.
         """
-        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
         m_sqrt = math.ceil(math.sqrt(m))
         total_num = m_sqrt ** 2
-        xs= np.arange(1, m_sqrt+1)
-        ys=np.arange(1, m_sqrt+1)
-        xx,yy=np.meshgrid(xs,ys)
-        grid_points = np.column_stack([xx.ravel(), yy.ravel()])
-        jitter = np.random.uniform(-0.4, 0.4, size=(total_num, 2))
-        jittered_points = (grid_points - 0.5 + jitter) / m_sqrt
-        # Randomly sample m points from the grid points
-        indices = np.random.choice(total_num, size=m, replace=False)
-        knots=jittered_points[indices]
-        return knots
+        xs= torch.arange(1, m_sqrt+1)
+        ys=torch.arange(1, m_sqrt+1)
+        xx,yy=torch.meshgrid(xs,ys,indexing='ij')
+        grid_points = torch.column_stack([xx.ravel(), yy.ravel()])
+        
+        knots_list = []
+
+        for _ in range(n_samples):
+            # For each sample: create new jitter
+            jitter = torch.empty(total_num, 2).uniform_(-0.4, 0.4)
+            jittered_points = (grid_points - 0.5 + jitter) / m_sqrt
+
+            # Then select m points
+            indices = torch.randperm(total_num)[:m]
+            knots = jittered_points[indices]
+
+            knots_list.append(knots)
+
+        knots_tensor = torch.stack(knots_list)  # shape (n_samples, m, 2)
+        
+        return knots_tensor
     
-    def generate_x_epsilon(self):
+    
+    def generate_x_epsilon(self,n_samples)->Tuple[torch.Tensor,torch.Tensor]:
         """
         Generates linear term with added noise.
 
@@ -458,104 +477,77 @@ class GPPSampleGeneratorUnitSquare:
         p = len(self.coefficients)  # Number of coefficients
 
         # Generate design matrix X with normal distribution
-        np.random.seed(self.seed)
-        X = np.random.normal(size=(self.num, p))
+        torch.manual_seed(self.seed)
+        X = torch.normal(mean=0, std=1, size=(n_samples,self.num, p))
+       
 
         # Generate noise term epsilon with normal distribution
-        epsilon = np.random.normal(scale=self.noise_level, size=self.num)
-        epsilon=epsilon.reshape(-1,1)
-        # Convert coefficients to NumPy array and reshape for matrix multiplication
-        coefficients_array = np.array(self.coefficients).reshape(p, 1)
+        epsilon= torch.normal(mean=0, std=self.noise_level, size=(n_samples,self.num,1))
+        
+        # Convert coefficients to torch tensor for matrix multiplication
+        coefficients_array = torch.tensor(self.coefficients,dtype=torch.float32).reshape(p, 1)
 
         value= X @ coefficients_array + epsilon
+        
+        #turn value to be 2D
+        value = value.reshape(n_samples,self.num)
 
         return value,X
-    def generate_obs_gp(self,m:int,method:str)-> Tuple[np.ndarray, np.ndarray]: 
+    def generate_obs_gp(self,m:int,method:str,n_samples=1)-> List[Tuple[torch.Tensor, torch.Tensor]]: 
         """
         Generates observations following Gaussian Process.
 
         Returns:
-        - numpy.ndarray: Array of generated observations.
+        - torch.Tensor: Array of generated observations.
         """
-        np.random.seed(self.seed)
-        
+        torch.manual_seed(self.seed)
+                
         locations=self.random_points()
         if method=="random":
-            knots=self.get_knots_random(locations,m)
+            knots=self.get_knots_random(locations,m,n_samples)
         elif method=="grid":
-            knots=self.get_knots_grid(m)
+            knots=self.get_knots_grid(m,n_samples)
         else:  
             raise("Invalid choice. Please select from 'random' or 'grid'.")
         # Compute the covariance matrix using the kernel function
         cov = self.kernel(locations)
-
+        cov=torch.tensor(cov,dtype=torch.float32)
         # Initialize the mean vector as zeros
-        mean = np.zeros(self.num)
+        mean = torch.zeros(self.num)
 
         # Generate random samples (y) from a multivariate normal distribution
+        L = torch.linalg.cholesky(cov)
+        z_normal = torch.randn(n_samples, mean.numel())
+        y=z_normal @ L.T + mean
         
-        y = np.random.multivariate_normal(mean, cov)
-        y=y.reshape(-1,1)
         # Generate observations based on linear model: z = X @ coefficients + y + epsilon
-        value,X=self.generate_x_epsilon()
-        z = y+value
-        data=np.hstack((locations,z,X))
-        return data,knots
-    def generate_obs_gpp(self,m:int,method:str)-> Tuple[np.ndarray, np.ndarray]:
-
-        """
-        Generates observations following Gaussian Predictive Process(GPP).
-
-        Parameters:
-        - m (int): Number of knot points.
-        - method (str): Method for selecting knot points ("random" or "grid").
-
-        Returns:
-        - numpy.ndarray: Array of generated observations.
-        """
-
-        locations=self.random_points()    
-
-        if method=="random":
-            knots=self.get_knots_random(locations,m)
-        elif method=="grid":
-            knots=self.get_knots_grid(m)
-        else:  
-            raise("Invalid choice. Please select from 'random' or 'grid'.")  
-
-        # Generate random eta values from a multivariate normal distribution
-        np.random.seed(self.seed)
-        mean_eta = np.zeros(knots.shape[0])
-        cov_eta = self.kernel(knots)
-        eta = np.random.multivariate_normal(mean_eta, cov_eta)
-        eta=eta.reshape(-1,1)
-        # Compute the product B = K(locations, knots) @ inv(cov_eta)
-        B = self.kernel(locations, knots) @ np.linalg.inv(cov_eta)
-        
-        # Generate y using the GPP model: y = B @ eta
-        y = B @ eta
-
-        value,X=self.generate_x_epsilon()
-        z = y+value
-        data=np.hstack((locations,z,X))
-        return data,knots
-    def data_split(self,data:np.ndarray,J:int,method:str='random',neighbours:int=None)->List[np.ndarray]:
+        value,X=self.generate_x_epsilon(n_samples)
+        z:torch.Tensor = y+value
+        res=[]
+        for i in range(n_samples):
+            data = torch.hstack((locations,z[i].reshape(-1,1),X[i]))
+            tup=(data,knots)
+            res.append(tup)
+        return res
+    def data_split(self,data:torch.Tensor,J:int,method:str='random',neighbours:int=None)->List[torch.Tensor]:
         '''
         method: random, by area, random_nearest
         '''
         if method=='random':
-            dis_data=np.array_split(data,J,axis=0)
+            dis_data=list(torch.chunk(data,J,dim=0))
+            
         if method=='by_area':
             sqrt_J=int(math.sqrt(J))
             if int(sqrt_J**2)!=J:
-                Warning("it is not a perfect square")
+                Warning("J is not a perfect square, partitioning may be uneven.")
+                
             locations=data[:,:2]
             x_min, x_max = locations[:, 0].min(), locations[:, 0].max()
             y_min, y_max = locations[:, 1].min(), locations[:, 1].max()
             
             # Define the partition edges
-            x_bins = np.linspace(x_min, x_max, sqrt_J + 1)
-            y_bins = np.linspace(y_min, y_max, sqrt_J + 1)
+            x_bins = torch.linspace(x_min, x_max, sqrt_J + 1)
+            y_bins = torch.linspace(y_min, y_max, sqrt_J + 1)
             
             dis_data = []
             
@@ -572,29 +564,30 @@ class GPPSampleGeneratorUnitSquare:
                     dis_data.append(partition_data)
         if method=='random_nearest':
             if neighbours==None:
-                raise("please specify the number of nearest locations")
+                raise ValueError("please specify the number of nearest locations")
             N = data.shape[0]
             n = int(N / J)  # Size of each partition
             N_random = J * int(n / (1 + neighbours))  # Number of random locations
-
-            np.random.seed(self.seed)
-            data=np.random.permutation(data)
+            
+            torch.manual_seed(self.seed)
+            perm=torch.randperm(N)
+            data=data[perm]
             locations = data[:, :2]  # Only use the first two columns for locations
             random_locations = locations[0:N_random, :]  # Get random locations
 
             # Use scipy.spatial.distance.cdist for efficient distance calculation
             rest_locations=locations[N_random:,:]
-            dists = cdist(rest_locations, random_locations)  # Calculate pairwise distances
+            dists =torch.cdist(rest_locations, random_locations,p=2)  # Calculate pairwise distances
 
             # Initialize neighbour indices and nums
-            neighbours_idx = np.full((N_random, neighbours), -1, dtype=int)  # Stores the neighbor indices
-            nums = np.zeros(N_random, dtype=int)  # Keeps track of neighbors per random location
-
+            neighbours_idx=torch.full((N_random, neighbours), -1, dtype=torch.long)  # Stores the neighbor indices
+            nums = torch.zeros(N_random, dtype=torch.int)  # Keeps track of neighbors per random location
             # Assign each point to its nearest random location (up to 'neighbours' per random location)
             for i, dist_row in enumerate(dists):
+                dist_row = dist_row.clone()
                 # Set large distance for locations with full neighbors
-                dist_row[nums >= neighbours] = np.inf
-                idx = np.argmin(dist_row)  # Find the nearest random location
+                dist_row[nums >= neighbours] = torch.inf
+                idx = torch.argmin(dist_row)  # Find the nearest random location
                 neighbours_idx[idx, nums[idx]] = i+N_random  # Assign the point index
                 nums[idx] += 1  # Increment the neighbor count
 
@@ -612,7 +605,7 @@ class GPPSampleGeneratorUnitSquare:
                 dis_data.append(partition_data)
         
         return dis_data
-    def visual_locations(dis_data:List[np.ndarray],save_file=None,title=None):
+    def visual_locations(dis_data:List[torch.Tensor],save_file=None,title=None):
         J=len(dis_data)
         colors = plt.cm.get_cmap('tab10', J)  # Choose a colormap for the partitions
         plt.figure(figsize=(8, 6))
