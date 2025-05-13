@@ -9,3 +9,10 @@ src/MPI/__pycache__
 *log.txt
 *.DS_Store
 experiments
+exageostat
+install_exageostat_starpu_shaheen-III.sh
+codes
+src/MPI/separate_ini/__pycache__
+pkg_config.sh
+gfortran
+estimation_multiprocesses.py
