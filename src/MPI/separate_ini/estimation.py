@@ -841,6 +841,105 @@ class GlobalComputation():
         return param
 
 
+class InitializationWorker():
+    def __init__(self,comm: MPI.Intracomm, server_rank:int, local_computation: LocalComputation):
+        self.comm=comm
+        self.rank=comm.Get_rank()
+        self.server_rank=server_rank
+        self.size=comm.Get_size()
+        self.worker_id=self.rank
+        self.update_param:Parameter=Parameter() #store the newest parameter
+        self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
+        self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
+        self.local_computation=local_computation
+    def set_pre_local_quantity(self,local_quantity:LocalQuantity):
+        step=local_quantity.index[1]
+        self.pre_local_quantity_dict[step]=local_quantity
+    
+    def get_initial_param(self,param0: Parameter)->Parameter:
+        
+        try:
+            param = self.local_computation.get_local_minimizer(param0)
+            return param
+        except Exception as e:
+            logging.error(f"Error in get_initial_param: {e}")
+            return None
+    def set_local_params(self, param:Parameter):
+        #when a new parameter is received, add it to the local parameters
+        for name in ['mu', 'sigma', 'gamma', 'delta', 'theta']:
+            value = getattr(param, name)
+            if value is not None:
+                setattr(self.update_param, name, value)
+            else:
+                setattr(param, name, getattr(self.update_param, name))
+        id=None
+        if self.local_params is not None and len(self.local_params)>0:
+            for i, local_param in enumerate(self.local_params):
+                if local_param.index[1]==param.index[1]:
+                    id=i
+        if id is None:
+            self.local_params.append(param)
+        else:
+            self.local_params[id]=param
+      
+    def compute_local_quantity(self, param: Parameter,step: StepType=None)->LocalQuantity:
+        if step is None:
+            step=param.index[1]
+        elif param.index[1] is None:
+            param.index[1]=step
+        elif step!=param.index[1]:
+            warn("the step is not consistent with the step in parameter", category=None, stacklevel=1)
+        if step==StepType.MU_SIGMA:
+            value=self.local_computation.compute_local_for_mu_sigma(param)
+        elif step==StepType.GAMMA:
+            # compute local quantity for gamma
+            value=self.local_computation.compute_local_for_gamma(param)
+        elif step==StepType.DELTA:
+            # compute local quantity for delta
+            value=self.local_computation.compute_local_for_delta(param)
+        elif step==StepType.THETA:
+            # compute local quantity for theta
+            value=self.local_computation.compute_local_for_theta(param)
+        elif step==StepType.DELTA_THETA:
+            # compute local quantity for theta and delta
+            value=self.local_computation.compute_local_for_theta_delta(param)    
+        return LocalQuantity(self.worker_id, value, param.index)
+    def compute_para_ind_local_quantity(self)->Dict[str,torch.Tensor]: 
+        #compute local quantity that is independent of the parameter
+        para_ind_local_quantity={}
+        para_ind_local_quantity['XX']=self.local_computation.local_XX()
+        para_ind_local_quantity['Xz']=self.local_computation.local_Xz()
+        para_ind_local_quantity['n']=self.local_computation.local_n()
+        return para_ind_local_quantity
+    def initialization(self):
+        while True:
+            information=self.comm.bcast(None, root=self.server_rank)
+            if information['message']=='loc_opt':
+                param0=information['param0']
+                initial_param=self.get_initial_param(param0=param0)
+                self.comm.gather(initial_param,root=self.server_rank)
+            elif information['message']=='compute_para_ind_quantity':
+                para_ind_local_quantity=self.compute_para_ind_local_quantity()
+                self.comm.gather(para_ind_local_quantity,root=self.server_rank)
+            elif information['message']=='compute_local_quantity':
+                param=information['param']
+                step=information['step']
+                local_quantity=self.compute_local_quantity(param,step)
+                self.set_pre_local_quantity(local_quantity)
+                self.comm.gather(local_quantity,root=self.server_rank)
+            elif information['message']=='set_type_LR':
+                type_LR=information['type_LR']
+                self.local_computation.type_LR=type_LR
+                
+            elif information['message']=='stop':
+                param=information['param']
+                self.set_local_params(param=param)
+                break
+    def save(self,filename:str):
+        #save self.local_params, self.pre_local_quantity_dict
+        with open(filename, 'wb') as f:
+            pickle.dump({'local_params': self.local_params, 'pre_local_quantity_dict': self.pre_local_quantity_dict, 'update_param': self.update_param}, f)
+            
 class Worker():
     def __init__(self,comm: MPI.Intracomm, server_rank:int, local_computation: LocalComputation,logger:logging.Logger,iflog=True):
         self.comm=comm
@@ -849,12 +948,11 @@ class Worker():
         self.size=comm.Get_size()
         self.worker_id=self.rank
         self.cur_param=None # used for computing local quantity
-        self.update_param=None #store the newest parameter
+        self.update_param:Parameter=Parameter() #store the newest parameter
         self.local_params: Deque[Parameter]= deque()  # is a queue of local parameters, in the principal of "first in and first out"
         self.coming_time=None
         self.pre_local_quantity_dict:Dict[StepType,LocalQuantity]={}
         self.local_computation=local_computation
-        self.local_quantity=None
         self.local_quantities:Deque[LocalQuantity]=deque()
         if iflog:
             self.logger=logger
@@ -902,10 +1000,9 @@ class Worker():
             self.local_params.append(param)
         else:
             self.local_params[id]=param
-        
+                
             
-            
-    def compute_local_quantity(self, param: Parameter,step: StepType|None=None)->LocalQuantity:
+    def compute_local_quantity(self, param: Parameter,step: StepType=None)->LocalQuantity:
         if step is None:
             step=param.index[1]
         elif param.index[1] is None:
@@ -932,14 +1029,6 @@ class Worker():
         if self.cur_param:
             local_quantity=self.compute_local_quantity(self.cur_param)
             return local_quantity
-    def compute_para_ind_local_quantity(self)->Dict[str,torch.Tensor]: 
-        #compute local quantity that is independent of the parameter
-        para_ind_local_quantity={}
-        para_ind_local_quantity['XX']=self.local_computation.local_XX()
-        para_ind_local_quantity['Xz']=self.local_computation.local_Xz()
-        para_ind_local_quantity['n']=self.local_computation.local_n()
-        return para_ind_local_quantity
-    
     def compute_dif_and_update_pre(self)->LocalQuantity:
         local_quantity=self.compute_new_local_quantity()
         step=local_quantity.index[1]
@@ -950,50 +1039,13 @@ class Worker():
         self.set_pre_local_quantity(local_quantity)
         return dif_quantity         
     
-    def initialization(self):
-        '''
-        #use all the cpus for the initialization, then restore the cpu affinity for later use
-        process = psutil.Process()
-        cpu_affinity_pre=process.cpu_affinity()
-        process.cpu_affinity([])
-        num_cpus=len(process.cpu_affinity())
-        os.environ['OMP_NUM_THREADS'] = str(num_cpus)
-        os.environ['MKL_NUM_THREADS'] = str(num_cpus)
-        os.environ['NUMEXPR_NUM_THREADS'] = str(num_cpus)
-        os.environ['TORCH_NUM_THREADS'] = str(num_cpus)
-        '''
-        while True:
-            information=self.comm.bcast(None, root=self.server_rank)
-            if information['message']=='loc_opt':
-                param0=information['param0']
-                initial_param=self.get_initial_param(param0=param0)
-                self.comm.gather(initial_param,root=self.server_rank)
-            elif information['message']=='compute_para_ind_quantity':
-                para_ind_local_quantity=self.compute_para_ind_local_quantity()
-                self.comm.gather(para_ind_local_quantity,root=self.server_rank)
-            elif information['message']=='compute_local_quantity':
-                param=information['param']
-                step=information['step']
-                local_quantity=self.compute_local_quantity(param,step)
-                self.set_pre_local_quantity(local_quantity)
-                self.comm.gather(local_quantity,root=self.server_rank)
-            elif information['message']=='set_type_LR':
-                type_LR=information['type_LR']
-                self.local_computation.type_LR=type_LR
-                
-            elif information['message']=='stop':
-                param=information['param']
-                self.set_local_params(param=param)
-                break
-        '''
-        #restore the cpu affinity
-        process.cpu_affinity(cpu_affinity_pre)
-        num_cpus=len(process.cpu_affinity())
-        os.environ['OMP_NUM_THREADS'] = str(num_cpus)
-        os.environ['MKL_NUM_THREADS'] = str(num_cpus)
-        os.environ['NUMEXPR_NUM_THREADS'] = str(num_cpus)
-        os.environ['TORCH_NUM_THREADS'] = str(num_cpus)
-        '''
+    def initialization(self,initial_worker_path:str):
+        with open(initial_worker_path, 'rb') as f:
+            initial_worker_dict:Dict= pickle.load(f)
+        self.pre_local_quantity_dict=initial_worker_dict['pre_local_quantity_dict']
+        self.local_params=initial_worker_dict['local_params']
+        self.update_param=initial_worker_dict['update_param']
+
     
     def send_local_quantity(self):
         #the thread sending local quantity to the server
@@ -1013,8 +1065,7 @@ class Worker():
             local_quantity.value['start_time_send']=start_time_send
             information={'message':'local_quantity','param':local_quantity}
             self.comm.send(information,dest=self.server_rank)
-            #if self.logger is not None:
-            #    self.logger.info(f"worker {self.worker_id} sends the local quantity {local_quantity.index}")
+            
                 
                 
     def compute_local_quantity_thread(self):
@@ -1048,9 +1099,10 @@ class Worker():
         while not self.stop_flag.is_set():
             information=self.comm.recv(source=self.server_rank)
             if information['message']=='compute_local_quantity':
-                param=information['param']
+                param:Parameter=information['param']
                 with self.condition_receive:
                     self.set_local_params(param)
+                    
                     self.condition_receive.notify()
             elif information['message']=='stop':
                 self.stop_flag.set()
@@ -1059,32 +1111,13 @@ class Worker():
                 break
     
     
-    def start(self,cpu_affinity_cores:List[int]=None):
+    def start(self,initialization_worker_path:str):
         #start the worker
         if self.logger is not None:
             self.logger.info(f"worker {self.worker_id} starts initialization")
-        self.initialization()
+        self.initialization(initialization_worker_path)
         
-        process = psutil.Process()
-        if cpu_affinity_cores is not None:
-            process.cpu_affinity(cpu_affinity_cores)
-            num_cpus_logical=len(cpu_affinity_cores)
-            num_cpus_physical=int(num_cpus_logical/2)
-            os.environ['NUMEXPR_MAX_THREADS'] = str(num_cpus_physical)
-            torch.set_num_threads(num_cpus_physical)
-            torch.set_num_interop_threads(num_cpus_physical)
-            numexpr.set_num_threads(num_cpus_physical)
-            if self.logger is not None:
-                self.logger.info(f"worker {self.worker_id} sets the cpu affinity to {cpu_affinity_cores}")
-        else:
-            process.cpu_affinity([])
-            num_cpus_logical=len(process.cpu_affinity())
-            num_cpus_physical=int(num_cpus_logical/2)
-            os.environ['NUMEXPR_MAX_THREADS'] = str(num_cpus_physical)
-            torch.set_num_threads(num_cpus_physical)
-            torch.set_num_interop_threads(num_cpus_physical)
-            numexpr.set_num_threads(num_cpus_physical)
-
+        
         send_thread=threading.Thread(target=self.send_local_quantity)
         receive_thread=threading.Thread(target=self.receive_param)
         compute_thread=threading.Thread(target=self.compute_local_quantity_thread)
@@ -1094,12 +1127,11 @@ class Worker():
         send_thread.join()
         receive_thread.join()
         compute_thread.join()
-     
-class  Server():
-    def __init__(self,comm: MPI.Intracomm,concurrency:int,global_computation:GlobalComputation,logger: logging.Logger,theta_logger: logging.Logger,type_LR='F',dl_th_together=False,iflog=True):
+
+class InitializationServer():
+    def __init__(self,comm: MPI.Intracomm,global_computation:GlobalComputation,type_LR='F',dl_th_together=False):
         self.param:Parameter = None # The global parameter for the model
         self.params:List[Parameter]=[]
-        self.params_GDT:List[Parameter]=[] # The global parameters for the model
         self.comm=comm
         self.rank=comm.Get_rank()
         self.size=comm.Get_size() # The number of workers+1 (server)
@@ -1108,20 +1140,9 @@ class  Server():
         self.worker_ranks = [rank for rank in range(self.size) if rank != self.rank]        
         self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
         self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
-        self.concurrency=concurrency # The number of workers that are needed to compute the global quantities
         global_computation.reset()
         self.global_computation=global_computation
         
-        
-        self.condition_receive=threading.Condition()
-        self.condition_send=threading.Condition()
-        self.params_index:Dict[int,int]={worker_rank:0 for worker_rank in self.worker_ranks}
-        self.stop_flag = threading.Event()
-        if iflog:
-            self.logger=logger
-        else:
-            self.logger=None
-        self.theta_logger=theta_logger
         if type_LR in ['F', 'P', 'H']:
             self.type_LR=type_LR
             self.global_computation.type_LR=self.type_LR
@@ -1130,7 +1151,6 @@ class  Server():
         
         self.dl_th_together=dl_th_together # if True, the delta and theta are updated together, otherwise, they are updated separately
         self.choice_dict={}
-
     def initial_step(self,step: StepType=None):
         if step is None:
             step=self.param.index[1]
@@ -1166,21 +1186,6 @@ class  Server():
         
     def initialization(self,param0: Parameter,params_path:str=None):
         #initialize the global parameter and the local quantities
-        ''' 
-        #use all the cpus for the initialization, then restore the cpu affinity for later use
-        process = psutil.Process()
-        cpu_affinity_pre=process.cpu_affinity()
-        process.cpu_affinity([])
-        cpu_affinity=process.cpu_affinity()
-        num_cpus=len(cpu_affinity) #the number of logical cores
-        os.environ['OMP_NUM_THREADS'] = str(num_cpus)
-        os.environ['MKL_NUM_THREADS'] = str(num_cpus)
-        os.environ['NUMEXPR_NUM_THREADS'] = str(num_cpus)
-        os.environ['TORCH_NUM_THREADS'] = str(num_cpus)
-        '''
-        #use step size 0.5 for the initialization, then restore the step size for later use
-        step_size_inner_pre=self.global_computation.step_size_inner
-        self.global_computation.step_size_inner=0.5
         information={'type_LR':self.type_LR,'message':'set_type_LR'}
         self.comm.bcast(information, root=self.rank)
         
@@ -1201,7 +1206,6 @@ class  Server():
             
         self.param =compute_average_param(params)
         self.param.index=(0,StepType.MU_SIGMA,0)
-        self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
         #initialize the global quantities that are independent of the parameter
         if self.type_LR=='F':
             keys={'XX','Xz','n'} #n is the average local sample size
@@ -1241,31 +1245,61 @@ class  Server():
                 
         self.param.index=(1,StepType.MU_SIGMA,0)
         self.comm.bcast({"message":"stop","param":self.param}, root=self.rank)
-        '''
-        #restore the cpu affinity
-        process.cpu_affinity(cpu_affinity_pre)
-        num_cpus=len(cpu_affinity_pre)
-        #restore the environment variables
-        os.environ['OMP_NUM_THREADS'] = str(num_cpus)
-        os.environ['MKL_NUM_THREADS'] = str(num_cpus)
-        os.environ['NUMEXPR_NUM_THREADS'] = str(num_cpus)
-        os.environ['TORCH_NUM_THREADS'] = str(num_cpus)
-        '''
-        #restore the step size
-        self.global_computation.step_size_inner=step_size_inner_pre
-    
+    def save(self,filename:str):
+        #save self.param, self.global_quantities, self.global_computation.global_para_ind_quantities
+        with open(filename, 'wb') as f:
+            pickle.dump({'param': self.param, 'global_quantities': self.global_quantities, 'global_para_ind_quantities': self.global_computation.global_para_ind_quantities}, f)
+     
+class  Server():
+    def __init__(self,comm: MPI.Intracomm,concurrency:int,global_computation:GlobalComputation,logger: logging.Logger,theta_logger: logging.Logger,type_LR='F',dl_th_together=False,iflog=True):
+        self.param:Parameter = None # The global parameter for the model
+        self.params:List[Parameter]=[]
+        self.params_GDT:List[Parameter]=[] # The global parameters for the model
+        self.comm=comm
+        self.rank=comm.Get_rank()
+        self.size=comm.Get_size() # The number of workers+1 (server)
+        self.J=self.size-1 # The number of workers
+        #get the rank of local workers: from 0 to self.size, except self rank
+        self.worker_ranks = [rank for rank in range(self.size) if rank != self.rank]        
+        self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
+        self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
+        self.concurrency=concurrency # The number of workers that are needed to compute the global quantities
+        global_computation.reset()
+        self.global_computation=global_computation
+        
+        
+        self.condition_receive=threading.Condition()
+        self.condition_send=threading.Condition()
+        self.params_index:Dict[int,int]={worker_rank:0 for worker_rank in self.worker_ranks}
+        self.stop_flag = threading.Event()
+        if iflog:
+            self.logger=logger
+        else:
+            self.logger=None
+        self.theta_logger=theta_logger
+        if type_LR in ['F', 'P', 'H']:
+            self.type_LR=type_LR
+            self.global_computation.type_LR=self.type_LR
+        else:
+            raise(ValueError("Invalid type_LR. Choose from 'F', 'P', or 'H'."))
+        
+        self.dl_th_together=dl_th_together # if True, the delta and theta are updated together, otherwise, they are updated separately
+        self.choice_dict={}
+        
+    def initialization(self,initialization_server_path:str):
+        with open(initialization_server_path, 'rb') as f:
+            initialization_server_dict:Dict= pickle.load(f)
+        self.param=initialization_server_dict['param']
+            
+        self.global_quantities=initialization_server_dict['global_quantities']
+        self.global_computation.set_global_para_ind_quantities(initialization_server_dict['global_para_ind_quantities'])
+        
     def update_parameter_by_step(self,step:StepType):
         with self.condition_receive:
-            start_time = time.time()
-            old=self.local_quantities.get_count_by_step(step)
             while self.local_quantities.get_count_by_step(step)<self.concurrency:
                 wait_result = self.condition_receive.wait(timeout=300)  # 5 minutes timeout
                 if not wait_result:
                     raise(f"Timeout waiting for waiting local quantities for step {step}")
-            end_time = time.time()
-            increment=self.local_quantities.get_count_by_step(step)-old
-            if self.logger is not None:
-                self.logger.info(f"server receives {self.local_quantities.get_count_by_step(step)} (old:{old}, increment:{increment}) local quantities for step {step} in {end_time-start_time} seconds")
             local_quantities_by_step=self.local_quantities.get_by_step(step)
             self.local_quantities.remove_by_step(step)  
               
@@ -1362,8 +1396,10 @@ class  Server():
             information={'message':'stop'}
             self.comm.send(information,dest=worker_rank)
     def update_parameter(self,T,S,ratio=1,inner_precision=1e-5):
+        times_elapsed = [0] # start from 0
+        params_GDT=[]
+        params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta)) # add the initial parameter
         start_time_g = time.time()
-        times_elapsed = []
         for t in range(T):
             choice=random.sample(self.worker_ranks, int(ratio*len(self.worker_ranks)))
             #sort choices
@@ -1376,12 +1412,12 @@ class  Server():
             self.update_parameter_by_step(StepType.MU_SIGMA) 
             self.param.index=(t+1,StepType.GAMMA,0) 
             param=Parameter(mu=self.param.mu,sigma=self.param.sigma,index=self.param.index) 
+            
             with self.condition_send:
                 self.params.append(param)
                 self.condition_send.notify_all()
             # step GAMMA
             self.update_parameter_by_step(StepType.GAMMA)
-            
             if self.dl_th_together:
                 self.param.index=(t+1,StepType.DELTA_THETA,0)
                 param=Parameter(gamma=self.param.gamma,index=self.param.index)
@@ -1394,8 +1430,6 @@ class  Server():
                     old_delta = self.param.delta.clone()
                     
                     self.update_parameter_by_step(StepType.DELTA_THETA)
-                    if self.logger is not None:
-                        self.logger.info(f"theta:{self.param.theta.tolist()}")
                     self.theta_logger.info(f"theta:{self.param.theta.tolist()}")
                     theta_change = (self.param.theta - old_theta).norm()
                     delta_change = (self.param.delta - old_delta).norm()
@@ -1426,9 +1460,9 @@ class  Server():
                 # step DELTA
                 self.update_parameter_by_step(StepType.DELTA)
                 self.param.index=(t+1,StepType.THETA,0)
-                param=Parameter(delta=self.param.delta,index=self.param.index)
+                param=Parameter(delta=self.param.delta,theta=self.param.theta,index=self.param.index)  # Add theta
                 with self.condition_send:
-                    self.params.append(self.param)
+                    self.params.append(param)  # Use param instead of self.param
                     self.condition_send.notify_all()
                 # step THETA
                 for s in range(S):
@@ -1457,43 +1491,17 @@ class  Server():
                             self.params.append(param)
                             self.condition_send.notify_all()
             times_elapsed.append(time.time() - start_time_g)
-            self.params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
+            params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta))
         
         self.times_elapsed = times_elapsed
-            
+        self.params_GDT=params_GDT
         self.stop_flag.set() 
         with self.condition_send:
             self.condition_send.notify_all()
           
-    def start(self,param0: Parameter,T,S,local_params_path:str=None,ratio=1,inner_precision=1e-5,cpu_affinity_cores:List[int]=None):
+    def start(self,T:int,S:int,initialization_server_path:str,ratio=1,inner_precision=1e-5):
         try:
-            if self.logger is not None:
-                self.logger.info('Server starts initialization')
-            start_time_initialization=time.time()
-            self.initialization(param0,local_params_path)
-            end_time_initialization=time.time()
-            
-            if cpu_affinity_cores is not None:
-                process.cpu_affinity(cpu_affinity_cores)
-                num_cpus_logical=len(cpu_affinity_cores)
-                num_cpus_physical=int(num_cpus_logical/2)
-                os.environ['NUMEXPR_MAX_THREADS'] = str(num_cpus_physical)
-                torch.set_num_threads(num_cpus_physical)
-                torch.set_num_interop_threads(num_cpus_physical)
-                numexpr.set_num_threads(num_cpus_physical)
-
-            else:
-                process.cpu_affinity([])
-                num_cpus_logical=len(process.cpu_affinity())
-                num_cpus_physical=int(num_cpus_logical/2)
-                os.environ['NUMEXPR_MAX_THREADS'] = str(num_cpus_physical)
-                torch.set_num_threads(num_cpus_physical)
-                torch.set_num_interop_threads(num_cpus_logical)
-                numexpr.set_num_threads(num_cpus_logical)
-            
-            if self.logger is not None:
-                self.logger.info(f'Server finishes initialization in {end_time_initialization-start_time_initialization} seconds')
-            self.theta_logger.info(f'Server finishes initialization in {end_time_initialization-start_time_initialization} seconds')
+            self.initialization(initialization_server_path)
             #receive_thread=threading.Thread(target=self.receive_local_quantity)
             time_start=time.time()
             receive_threads:List[threading.Thread]=[]

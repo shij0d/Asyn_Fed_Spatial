@@ -519,7 +519,12 @@ class GPPSampleGeneratorUnitSquare:
 
 
         # Generate random samples (y) from a multivariate normal distribution
+        if n_samples>=1*10**5:
+            cov=cov.to(torch.float32) #for memory efficiency
         L = torch.linalg.cholesky(cov)
+        if n_samples>=1*10**5:
+            L=L.to(torch.float32)
+        
         z_normal = torch.randn(n_samples, cov.shape[0], dtype=torch.float64)
         y=z_normal @ L.T 
         
