@@ -16,3 +16,4 @@ src/MPI/separate_ini/__pycache__
 pkg_config.sh
 gfortran
 estimation_multiprocesses.py
+src/MPI/separate_ini/test
