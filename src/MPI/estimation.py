@@ -1000,7 +1000,7 @@ class Worker():
         while not self.stop_flag.is_set():
             with self.condition_send:
                 while len(self.local_quantities)==0:
-                    wait_result=self.condition_send.wait(timeout=300)
+                    wait_result=self.condition_send.wait(timeout=600)
                     if not wait_result:
                         if self.logger is not None:
                             self.logger.info(f"Timeout waiting for send local quantity to server")
@@ -1022,7 +1022,7 @@ class Worker():
         while not self.stop_flag.is_set():
             with self.condition_receive:
                 while len(self.local_params)==0:
-                    wait_result=self.condition_receive.wait(timeout=300)
+                    wait_result=self.condition_receive.wait(timeout=600)
                     if not wait_result:
                         if self.logger is not None:
                             self.logger.info(f"Timeout of worker {self.worker_id} waiting for receiving param from server")
@@ -1259,7 +1259,7 @@ class  Server():
             start_time = time.time()
             old=self.local_quantities.get_count_by_step(step)
             while self.local_quantities.get_count_by_step(step)<self.concurrency:
-                wait_result = self.condition_receive.wait(timeout=300)  # 5 minutes timeout
+                wait_result = self.condition_receive.wait(timeout=600)  # 10 minutes timeout
                 if not wait_result:
                     raise(f"Timeout waiting for waiting local quantities for step {step}")
             end_time = time.time()
@@ -1342,7 +1342,7 @@ class  Server():
                     index=self.params_index[worker_rank]
                     while index>=len(self.params):
                         # wait for new param to be added, then check if the number is sufficient
-                        wait_result=self.condition_send.wait(timeout=300)  # 5 minutes timeout
+                        wait_result=self.condition_send.wait(timeout=600)  # 10 minutes timeout
                         if not wait_result:
                             if self.logger is not None:
                                 self.logger.info(f"Timeout waiting for send param to worker {worker_rank}")
