@@ -3,6 +3,7 @@ project_path='/scratch/shij0d/projects/Asyn_Fed_Spatial'
 import sys
 import os
 import argparse
+import numpy as np
 sys.path.append(project_path)
 from typing import List
 
@@ -42,6 +43,11 @@ def parse_arguments():
                         help='the directory of the generated data to be saved')
     parser.add_argument('--seed', type=int, default=123,
                         help='the seed')
+    parser.add_argument('--exageostat_computation', type=str, default='False',
+                        help='whether to use exageostat computation')
+    parser.add_argument('--path_location_exageostat', type=str,default=None, 
+                        help='the path of generated locations by the exageostat')
+    parser.add_argument('--path_observations_exageostat', type=str,default=None, help='the path of generated observations by the exageostat')
     return parser.parse_args()
 
 args=parse_arguments()
@@ -51,6 +57,7 @@ alpha=args.alpha
 length_scale=args.length_scale
 nu=args.nu
 n=args.num_samples
+exageostat_computation = args.exageostat_computation.lower() == 'true'  # Convert string to boolean
 N=n*J
 coefficients=eval(args.coefficients)
 noise_level=args.noise_level
@@ -72,11 +79,40 @@ param0=Parameter(None,None,gamma,delta,theta) # the initial value for gamma, the
 
 
 sampler=GPPSampleGeneratorUnitSquare(num=N,kernel=kernel,coefficients=coefficients,noise_level=noise_level,seed=r)
-start_time = time.time()
-res=sampler.generate_obs_gp(m=m,method="random")
-end_time = time.time()
-print("Time taken to generate data: ", end_time - start_time)
-data,knots=res[0]
+if exageostat_computation:
+    #read the latent observations and locations 
+    path_location_exageostat=args.path_location_exageostat
+    path_observations_exageostat=args.path_observations_exageostat
+    observations_latent = np.loadtxt(path_observations_exageostat)  # W vector
+    observations_latent=torch.tensor(observations_latent,dtype=torch.float64)
+    if len(observations_latent)<N:
+        raise ValueError("the number of observations by the exageostat is less than the required number of samples")
+    locations = np.loadtxt(path_location_exageostat, delimiter=',')  # LOC 
+    locations=torch.tensor(locations,dtype=torch.float64)
+    
+    #permutation of observations_latent and locations
+    perm=torch.randperm(N)
+    observations_latent=observations_latent[perm].reshape(-1,1)
+    print("observations_latent.shape:",observations_latent.shape)
+    locations=locations[perm]
+    print("locations.shape:",locations.shape)
+    #add the covariates and the noise
+    value,X=sampler.generate_x_epsilon(1)
+    value=value.squeeze().reshape(-1,1)
+    print("value.shape:",value.shape)
+    X=X.squeeze().reshape(-1,len(coefficients))
+    print("X.shape:",X.shape)
+    z:torch.Tensor = observations_latent+value
+    data = torch.hstack((locations,z.reshape(-1,1),X))
+    
+    knots_list=sampler.get_knots_random(locations=locations,m=m,n_samples=1)
+    knots=knots_list[0]
+else:
+    start_time = time.time()
+    res=sampler.generate_obs_gp(m=m,method="random")
+    end_time = time.time()
+    print("Time taken to generate data: ", end_time - start_time)
+    data,knots=res[0]
 dis_data=sampler.data_split(data,J)
 data_dir = args.data_dir
 os.makedirs(data_dir, exist_ok=True)
