@@ -73,6 +73,8 @@ def parse_arguments():
                         help='the setting of the threads, each number corresponds to a setting')
     parser.add_argument('--binding_setting', type=int, default=0,
                         help='CPU binding setting: 0=no binding, 1=bind to physical cores, 2=bind to logical cores')
+    parser.add_argument('--iflog', type=str, default='False',
+                        help='if log the information')
     # Parse arguments on rank 0 only to avoid conflicts
     if MPI.COMM_WORLD.Get_rank() == 0:
         args = parser.parse_args()
@@ -120,6 +122,14 @@ data_dir = args.data_dir
 initialization_dir = args.initialization_dir
 result_dir = args.result_dir
 type_LR = args.type_LR
+#lower letter of iflog
+if args.iflog.lower()=='false':
+    if_log = False
+elif args.iflog.lower()=='true':
+    if_log = True
+else:
+    raise ValueError(f"iflog must be 'False' or 'True', but got {args.iflog}")
+
 num_cpus_list = args.num_cpus_list
 num_cpus_list = eval(num_cpus_list)  # Convert string to list
 num_cpus_list = [int(num_cpus) for num_cpus in num_cpus_list]
@@ -212,11 +222,26 @@ elif threads_setting == 10:
 elif threads_setting == 11:
     os.environ['OMP_NUM_THREADS'] = str(num_cpus_physical // 2)
     os.environ['MKL_NUM_THREADS'] = str(num_cpus_physical // 2)
+elif threads_setting == 12:
+    os.environ['NUMEXPR_MAX_THREADS'] = str(num_cpus_physical)
+    os.environ['OMP_NUM_THREADS'] = str(20)
+    os.environ['MKL_NUM_THREADS'] = str(num_cpus_physical)
+    os.environ['TORCH_NUM_THREADS'] = str(num_cpus_physical) 
+elif threads_setting == 13: #default setting to prevent oversubscription
+    os.environ['NUMEXPR_MAX_THREADS'] = str(1)
+    os.environ['OMP_NUM_THREADS'] = str(1)
+    os.environ['MKL_NUM_THREADS'] = str(1)
     
 
-
 #load the torch and numpy after the process.cpu_affinity
-from src.MPI.separate_ini.estimation import Server,Worker,LocalComputation,GlobalComputation
+from src.MPI.separate_ini.estimation import Server,Worker,LocalComputation,GlobalComputation,torch
+
+
+if num_cpus_physical>5:
+    torch.set_num_threads(num_cpus_physical//2-2) #default setting to prevent oversubscription
+else:
+    torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 if rank==server_rank:
     #logger.info("Initializing server process")
@@ -237,7 +262,7 @@ if rank==server_rank:
     kernel_est=data_dict["kernel_est"]
     param0=data_dict["param0"]
     global_computation=GlobalComputation(knots,kernel_est,step_size_inner=step_size)
-    server=Server(comm,concurrency=concurrency,global_computation=global_computation,logger=logger,theta_logger=theta_logger,type_LR=type_LR,dl_th_together=dl_th_together_default,iflog=False)
+    server=Server(comm,concurrency=concurrency,global_computation=global_computation,logger=logger,theta_logger=theta_logger,type_LR=type_LR,dl_th_together=dl_th_together_default,iflog=if_log)
     os.makedirs(result_dir, exist_ok=True)
     params_path=os.path.join(result_dir, 'local_params.pkl')
     initialization_server_path=os.path.join(initialization_dir, f'initialization_server.pkl')
@@ -261,7 +286,7 @@ else:
     knots=data_dict["knots"]
     kernel_est=data_dict["kernel_est"]
     local_computation=LocalComputation(local_data,knots,kernel_est,type_LR=type_LR)
-    worker=Worker(comm=comm,server_rank=server_rank,local_computation=local_computation,logger=logger,iflog=False)
+    worker=Worker(comm=comm,server_rank=server_rank,local_computation=local_computation,logger=logger,iflog=if_log)
     initialization_worker_path=os.path.join(initialization_dir, f'initialization_worker_{worker_file_suffix}.pkl')
     worker.start(initialization_worker_path=initialization_worker_path)
 
