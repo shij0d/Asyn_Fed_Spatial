@@ -1052,7 +1052,7 @@ class Worker():
         while not self.stop_flag.is_set():
             with self.condition_send:
                 while len(self.local_quantities)==0:
-                    wait_result=self.condition_send.wait(timeout=300)
+                    wait_result=self.condition_send.wait(timeout=600)
                     if not wait_result:
                         if self.logger is not None:
                             self.logger.info(f"Timeout waiting for send local quantity to server")
@@ -1073,15 +1073,21 @@ class Worker():
         while not self.stop_flag.is_set():
             with self.condition_receive:
                 while len(self.local_params)==0:
-                    wait_result=self.condition_receive.wait(timeout=300)
+                    if self.logger is not None:
+                        self.logger.info(f"worker {self.worker_id} is waiting for receiving param from server")
+                    wait_result=self.condition_receive.wait(timeout=600)
                     if not wait_result:
                         if self.logger is not None:
                             self.logger.info(f"Timeout of worker {self.worker_id} waiting for receiving param from server")
+                    
                     if self.stop_flag.is_set():  # Check again after waking up
                         with self.condition_send:
                             self.condition_send.notify()
                             return 
                 self.cur_param=self.local_params.popleft() 
+                if self.logger is not None:
+                    self.logger.info(f"worker {self.worker_id} uses the received param from server or use local params to compute the local quantity with index {self.cur_param.index}")
+            
             start_time_compuation = time.time()  
             local_quantity=self.compute_dif_and_update_pre()
             end_time_compuation = time.time()
@@ -1089,6 +1095,10 @@ class Worker():
             #    self.logger.info(f" worker {self.worker_id} computes the local quantity {local_quantity.index} end with time {end_time_compuation}")
             local_quantity.value['start_time_compuation']=start_time_compuation
             local_quantity.value['end_time_compuation']=end_time_compuation
+            if self.logger is not None:
+                self.logger.info(f" worker {self.worker_id} computes the local quantity {local_quantity.index} end with time {end_time_compuation-start_time_compuation} and the torch threads: {torch.get_num_threads()}; total number of threads: {psutil.Process().num_threads()}, torch interop threads: {torch.get_num_interop_threads()}, python thread: {len(threading.enumerate())}")
+                #for pool in threadpool_info():
+                #    self.logger.info(f"pool: {pool}")
             #sleep(1)
             with self.condition_send:
                 self.local_quantities.append(local_quantity)
@@ -1117,6 +1127,8 @@ class Worker():
             self.logger.info(f"worker {self.worker_id} starts initialization")
         self.initialization(initialization_worker_path)
         
+        if self.logger is not None:
+            self.logger.info(f"worker {self.worker_id} finishes initialization")
         
         send_thread=threading.Thread(target=self.send_local_quantity)
         receive_thread=threading.Thread(target=self.receive_param)
@@ -1296,13 +1308,16 @@ class  Server():
         
     def update_parameter_by_step(self,step:StepType):
         with self.condition_receive:
+            time_start=time.time()
             while self.local_quantities.get_count_by_step(step)<self.concurrency:
-                wait_result = self.condition_receive.wait(timeout=300)  # 5 minutes timeout
+                wait_result = self.condition_receive.wait(timeout=600)  # 5 minutes timeout
                 if not wait_result:
                     raise(f"Timeout waiting for waiting local quantities for step {step}")
             local_quantities_by_step=self.local_quantities.get_by_step(step)
             self.local_quantities.remove_by_step(step)  
-              
+            time_end=time.time()
+            if self.logger is not None:
+                self.logger.info(f"server spends {time_end-time_start} seconds for waiting {self.concurrency} local quantities for step {step}")
         
         #take a summation of local_quantities_by_step, then get the global quantity
         step_keys_dict = {
@@ -1321,7 +1336,6 @@ class  Server():
         # Initialize sum dictionary
         sum_dict = {key: 0 for key in step_keys_dict[step]}
 
-        end_time_compuations=[]
         # Sum up all values for each key
         for work_id in local_quantities_by_step.keys():
             local_quantity = local_quantities_by_step[work_id]
@@ -1338,10 +1352,12 @@ class  Server():
         
         for key in step_keys_dict[step]:
             self.global_quantities[step][key]=self.global_quantities[step][key]+sum_dict[key]/self.J 
-        
+        time_start=time.time()
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta,StepType.DELTA_THETA:self.global_computation.update_delta_theta}
         self.param=step_func_dict[step](self.param,self.global_quantities[step])
-        
+        time_end=time.time()
+        if self.logger is not None:
+            self.logger.info(f"server spends {time_end-time_start} seconds for updating the parameter after receiving {self.concurrency} local quantities")
         
    
     # def receive_local_quantity(self):
@@ -1376,7 +1392,7 @@ class  Server():
                     index=self.params_index[worker_rank]
                     while index>=len(self.params):
                         # wait for new param to be added, then check if the number is sufficient
-                        wait_result=self.condition_send.wait(timeout=300)  # 5 minutes timeout
+                        wait_result=self.condition_send.wait(timeout=600)  # 5 minutes timeout
                         if not wait_result:
                             if self.logger is not None:
                                 self.logger.info(f"Timeout waiting for send param to worker {worker_rank}")
@@ -1409,7 +1425,10 @@ class  Server():
                 self.logger.info(f"iteration:{t}")
             self.theta_logger.info(f"iteration:{t}")
             # step MU_SIGMA
+            #time_start=time.time()
             self.update_parameter_by_step(StepType.MU_SIGMA) 
+            #time_end=time.time()
+            #self.theta_logger.info(f"time for mu_sigma:{time_end-time_start}")
             self.param.index=(t+1,StepType.GAMMA,0) 
             param=Parameter(mu=self.param.mu,sigma=self.param.sigma,index=self.param.index) 
             
@@ -1417,7 +1436,10 @@ class  Server():
                 self.params.append(param)
                 self.condition_send.notify_all()
             # step GAMMA
+            #time_start=time.time()
             self.update_parameter_by_step(StepType.GAMMA)
+            #time_end=time.time()
+            #self.theta_logger.info(f"time for gamma:{time_end-time_start}")
             if self.dl_th_together:
                 self.param.index=(t+1,StepType.DELTA_THETA,0)
                 param=Parameter(gamma=self.param.gamma,index=self.param.index)
