@@ -11,10 +11,11 @@ logger = logging.getLogger(__name__)
 process = psutil.Process()
 process.cpu_affinity([]) 
 num_cpus_physical=psutil.cpu_count(logical=False)
-os.environ['OMP_NUM_THREADS'] = str(num_cpus_physical)
-os.environ['MKL_NUM_THREADS'] = str(num_cpus_physical)
-os.environ['NUMEXPR_NUM_THREADS'] = str(num_cpus_physical)
+os.environ['OMP_NUM_THREADS'] = str(1)
+os.environ['MKL_NUM_THREADS'] = str(1)
+os.environ['NUMEXPR_NUM_THREADS'] = str(1)
 os.environ['TORCH_NUM_THREADS'] = str(num_cpus_physical)
+
 
 start_time=time.time()
 
