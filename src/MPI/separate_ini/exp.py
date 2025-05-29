@@ -75,6 +75,8 @@ def parse_arguments():
                         help='CPU binding setting: 0=no binding, 1=bind to physical cores, 2=bind to logical cores')
     parser.add_argument('--iflog', type=str, default='False',
                         help='if log the information')
+    parser.add_argument('--if_changing_step_size', type=str, default='False',
+                        help='if changing the step size during the iterations')
     # Parse arguments on rank 0 only to avoid conflicts
     if MPI.COMM_WORLD.Get_rank() == 0:
         args = parser.parse_args()
@@ -129,6 +131,12 @@ elif args.iflog.lower()=='true':
     if_log = True
 else:
     raise ValueError(f"iflog must be 'False' or 'True', but got {args.iflog}")
+if args.if_changing_step_size.lower()=='false':
+    if_changing_step_size=False
+elif args.if_changing_step_size.lower()=='true':
+    if_changing_step_size=True
+else:
+    raise ValueError(f"if_changing_step_size must be 'False' or 'True', but got {args.if_changing_step_size}")
 
 num_cpus_list = args.num_cpus_list
 num_cpus_list = eval(num_cpus_list)  # Convert string to list
@@ -261,7 +269,7 @@ if rank==server_rank:
     knots=data_dict["knots"]
     kernel_est=data_dict["kernel_est"]
     param0=data_dict["param0"]
-    global_computation=GlobalComputation(knots,kernel_est,step_size_inner=step_size)
+    global_computation=GlobalComputation(knots,kernel_est,step_size_inner=step_size,if_changing_step_size=if_changing_step_size)
     server=Server(comm,concurrency=concurrency,global_computation=global_computation,logger=logger,theta_logger=theta_logger,type_LR=type_LR,dl_th_together=dl_th_together_default,iflog=if_log)
     os.makedirs(result_dir, exist_ok=True)
     params_path=os.path.join(result_dir, 'local_params.pkl')

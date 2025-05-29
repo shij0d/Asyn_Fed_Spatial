@@ -657,12 +657,14 @@ class LocalComputation():
 class GlobalComputation():
     # The class that implements the computation in the server
     def __init__(self,knots:torch.Tensor,\
-        kernel:Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],step_size_inner:float,type_LR='F'):
+        kernel:Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],step_size_inner:float,type_LR='F',if_changing_step_size:bool=False):
         self.knots=knots
         self.kernel=kernel
         self.step_size_inner=step_size_inner
         self.global_para_ind_quantities:Dict[str,torch.Tensor]={}
         self.type_LR=type_LR #same as the type_LR in LocalComputation
+        self.if_changing_step_size=if_changing_step_size
+        self.count_iteration=0
     def reset(self):
         self.global_para_ind_quantities:Dict[str,torch.Tensor]={}
     def set_global_para_ind_quantities(self,global_para_ind_quantities:Dict[str,torch.Tensor]):
@@ -770,14 +772,19 @@ class GlobalComputation():
         modified_hess = eigenvectors@modified_eigenvalue_matrix@eigenvectors.T
         # if self.step_size_inner<0.1:
         #     self.step_size_inner=self.step_size_inner*2        
-        step_size=self.step_size_inner
+        #step_size=self.step_size_inner
+        if self.if_changing_step_size:
+            self.count_iteration+=1
+            step_size=max(1/math.sqrt(self.count_iteration),self.step_size_inner)
+        else:
+            step_size=self.step_size_inner
         
         
         invh_m_grad = torch.linalg.inv(modified_hess)@gradient
         theta = param.theta-step_size*invh_m_grad
         while theta[0]<=0 or theta[1]<=0:
             step_size=step_size/2
-            self.step_size_inner=step_size
+            #self.step_size_inner=step_size
             logging.info(f"step_size:{step_size}")
             theta = param.theta-step_size*invh_m_grad
             
@@ -823,7 +830,11 @@ class GlobalComputation():
         modified_hess = eigenvectors@modified_eigenvalue_matrix@eigenvectors.T
         # if self.step_size_inner<0.1:
         #     self.step_size_inner=self.step_size_inner*2        
-        step_size=self.step_size_inner
+        if self.if_changing_step_size:
+            self.count_iteration+=1
+            step_size=max(1/math.sqrt(self.count_iteration),self.step_size_inner)
+        else:
+            step_size=self.step_size_inner
         
         
         invh_m_grad = torch.linalg.inv(modified_hess)@gradient
@@ -832,7 +843,7 @@ class GlobalComputation():
         
         while (new_delta <= 0) or (new_theta <= 0).any():
             step_size=step_size/2
-            self.step_size_inner=step_size
+            #self.step_size_inner=step_size not to update step_size_inner to prevent the step_size_inner from being too small
             logging.info(f"step_size:{step_size}")
             new_theta = param.theta - step_size * invh_m_grad[1:]
             new_delta = param.delta - step_size * invh_m_grad[0]
@@ -1240,7 +1251,7 @@ class InitializationServer():
         self.initial_step(StepType.GAMMA)
         if self.dl_th_together:
             self.param.index=(0,StepType.DELTA_THETA,0)
-            S=5
+            S=1
             for s in range(S):
                 self.initial_step(StepType.DELTA_THETA)
                 self.param.index=(0,StepType.DELTA_THETA,s+1)
@@ -1250,7 +1261,7 @@ class InitializationServer():
             self.initial_step(StepType.DELTA)
             self.param.index=(0,StepType.THETA,0)
             #update theta
-            S=5
+            S=1
             for s in range(S):
                 self.initial_step(StepType.THETA)
                 self.param.index=(0,StepType.THETA,s+1)
