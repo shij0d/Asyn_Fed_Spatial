@@ -785,7 +785,7 @@ class GlobalComputation():
         while theta[0]<=0 or theta[1]<=0:
             step_size=step_size/2
             #self.step_size_inner=step_size
-            logging.info(f"step_size:{step_size}")
+            #logging.info(f"step_size:{step_size}")
             theta = param.theta-step_size*invh_m_grad
             
         param=Parameter(param.mu,param.sigma,param.gamma,param.delta,theta)
@@ -844,7 +844,7 @@ class GlobalComputation():
         while (new_delta <= 0) or (new_theta <= 0).any():
             step_size=step_size/2
             #self.step_size_inner=step_size not to update step_size_inner to prevent the step_size_inner from being too small
-            logging.info(f"step_size:{step_size}")
+            #logging.info(f"step_size:{step_size}")
             new_theta = param.theta - step_size * invh_m_grad[1:]
             new_delta = param.delta - step_size * invh_m_grad[0]
             
