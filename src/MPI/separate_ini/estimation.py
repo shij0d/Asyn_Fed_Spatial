@@ -1207,15 +1207,28 @@ class InitializationServer():
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta,StepType.DELTA_THETA:self.global_computation.update_delta_theta}
         self.param=step_func_dict[step](self.param,global_quantity_step)
         
-    def initialization(self,param0: Parameter,params_path:str=None):
+    def initialization(self,param0: Parameter,params_path:str=None,method:str='loc_opt'):
+        '''
+        method: 'loc_opt' or 'load' or 'direct':
+            
+            if method=='load', the params_path is the path to the file that contains the parameters
+            
+            if method=='loc_opt', the local optimization is used to get the initial parameters and param0 is for the local optimization
+            
+            if method=='direct', the param0 is the initial parameter
+        '''
         #initialize the global parameter and the local quantities
         information={'type_LR':self.type_LR,'message':'set_type_LR'}
         self.comm.bcast(information, root=self.rank)
-        
-        if params_path and os.path.exists(params_path):
+        if method=='load':
+            #check if the params_path exists
+            if not os.path.exists(params_path):
+                raise(FileNotFoundError(f"The file {params_path} does not exist."))
             with open(params_path, 'rb') as f:
                 params = pickle.load(f)
-        else:       
+            self.param =compute_average_param(params)
+            self.param.index=(0,StepType.MU_SIGMA,0)
+        elif method=='loc_opt':       
             #send param0
             information={'param0':param0,'message':'loc_opt'}
             self.comm.bcast(information, root=self.rank)
@@ -1226,9 +1239,15 @@ class InitializationServer():
             if params_path:
                 with open(params_path, 'wb') as f:
                     pickle.dump(params, f)
+            self.param =compute_average_param(params)
+            self.param.index=(0,StepType.MU_SIGMA,0)
+        elif method=='direct':
+            #use the param0 directly as the initial parameter
+            self.param=param0
+            self.param.index=(0,StepType.MU_SIGMA,0)
+        else:
+            raise(ValueError("Invalid method. Choose from 'loc_opt', 'load', or 'Direct'."))
             
-        self.param =compute_average_param(params)
-        self.param.index=(0,StepType.MU_SIGMA,0)
         #initialize the global quantities that are independent of the parameter
         if self.type_LR=='F':
             keys={'XX','Xz','n'} #n is the average local sample size

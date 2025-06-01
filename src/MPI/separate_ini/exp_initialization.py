@@ -14,17 +14,20 @@ num_cpus_physical=psutil.cpu_count(logical=False)
 os.environ['OMP_NUM_THREADS'] = str(1)
 os.environ['MKL_NUM_THREADS'] = str(1)
 os.environ['NUMEXPR_NUM_THREADS'] = str(1)
-os.environ['TORCH_NUM_THREADS'] = str(num_cpus_physical)
+
 
 
 start_time=time.time()
 
 from typing import Dict
 
-from src.MPI.separate_ini.estimation import InitializationServer,InitializationWorker,LocalComputation,GlobalComputation
+from src.MPI.separate_ini.estimation import InitializationServer,InitializationWorker,LocalComputation,GlobalComputation,torch
 import pickle
 from mpi4py import MPI
 import argparse
+
+torch.set_num_threads(num_cpus_physical)
+
 
 end_time=time.time()
 
@@ -47,6 +50,8 @@ def parse_arguments():
                         help='the directory to store the results')
     parser.add_argument('--type_LR', type=str, default='P',
                         help='the type of the local-rank models')
+    parser.add_argument('--method', type=str, default='loc_opt',
+                        help='the method to initialize the parameters')
     
     # Parse arguments on rank 0 only to avoid conflicts
     if MPI.COMM_WORLD.Get_rank() == 0:
@@ -63,7 +68,7 @@ step_size = args.step_size
 data_dir = args.data_dir
 result_dir = args.result_dir
 type_LR = args.type_LR
-
+method = args.method
 
 if type_LR == 'P' or type_LR == 'H':
     dl_th_together_default=True
@@ -85,7 +90,7 @@ if rank==server_rank:
     
     logger.info(f"Initializing server with {server.size} workers")
     params_path=os.path.join(result_dir, 'local_params.pkl')
-    server.initialization(param0,params_path)
+    server.initialization(param0,params_path,method=method)
     server.save(os.path.join(result_dir, 'initialization_server.pkl'))
     logger.info(f"Server initialization complete")
 else:
