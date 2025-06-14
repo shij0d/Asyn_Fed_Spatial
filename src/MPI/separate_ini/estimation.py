@@ -24,7 +24,8 @@ import threading
 import time 
 from torch.autograd.functional import hessian
 import traceback
-import numexpr
+from time import sleep
+import copy
 
 process = psutil.Process()
 
@@ -45,7 +46,7 @@ class Parameter():
         self.theta=theta
         self.delta=delta
         self.index=index # The index of the parameter, which is a tuple (t,i,s) with t being the round, i being the step and s being the iteration number of Newton's method for optimizing theta
-
+        self.invh_m_grad_norm=None
 def compute_average_param(params: List[Parameter]) -> Parameter:
         # Compute the average of the parameters
         valid_params = [param for param in params if param is not None]
@@ -85,7 +86,10 @@ class LocalQuantities():
             if (local_quantity.index[0] > existing_quantity.index[0]) or \
                (local_quantity.index[0] == existing_quantity.index[0] and local_quantity.index[2] > existing_quantity.index[2]):
                 self.local_quantities_dict[worker_id][step] = local_quantity
-    
+    def merge_new_local_quantilies_dict(self,local_quantities_dict:Dict[int,Dict[StepType,LocalQuantity]]):
+        for worker_id in local_quantities_dict.keys():
+            for step in local_quantities_dict[worker_id].keys():
+                self.merge_new(local_quantities_dict[worker_id][step])
     def merge_new_dif(self,local_quantity: LocalQuantity):
         worker_id = local_quantity.worker_id
         step = local_quantity.index[1]
@@ -517,7 +521,7 @@ class LocalComputation():
         # 2) Hessian w.r.t. var
         H:torch.Tensor = hessian(f_scalar, var)
 
-        return {'grad': grad.detach(), 'hessian': H.detach()}
+        return {'grad': grad.detach(), 'hessian': H.detach(),'delta_theta_old':var.detach()}
 
     def __FreeVector2Parameter_GDT(self, free_vector_GDT: torch.Tensor) -> Parameter:
         p = self.local_data.shape[1] - 3
@@ -706,23 +710,28 @@ class GlobalComputation():
         value['hessian']=hessian
         
         return value    
-        
-    def update_mu_Sigma(self,param:Parameter,global_quantity_mu_sigma:Dict[str,torch.Tensor]):
-        delta=param.delta
+    def pre_computation_for_mu_sigma(self,param:Parameter):
         theta=param.theta
-        
-        global_for_mu,global_for_sigma=global_quantity_mu_sigma['mu'],global_quantity_mu_sigma['sigma']
-         
-        J=self.global_para_ind_quantities['J']
-        
         K=self.K_f(theta)
         invK=torch.linalg.inv(K)
+        pre_quantity={}
+        pre_quantity['invK']=invK
+        return pre_quantity
+    def update_mu_Sigma(self,param:Parameter,global_quantity_mu_sigma:Dict[str,torch.Tensor],pre_quantity:Dict[str,torch.Tensor]):
+        delta=param.delta
+        global_for_mu,global_for_sigma=global_quantity_mu_sigma['mu'],global_quantity_mu_sigma['sigma']
+        invK=pre_quantity['invK']
+        J=self.global_para_ind_quantities['J']
+        
         tempM = invK+J*delta*global_for_sigma
         sigma = torch.linalg.inv(tempM)
         mu = -sigma@(J*delta*global_for_mu)
         param=Parameter(mu,sigma,param.gamma,param.delta,param.theta)
         return param
-    def update_gamma(self,param: Parameter,global_quantity_gamma:Dict[str,torch.Tensor]):
+    def pre_computation_for_gamma(self,param:Parameter):
+        pre_quantity={}
+        return pre_quantity
+    def update_gamma(self,param: Parameter,global_quantity_gamma:Dict[str,torch.Tensor],pre_quantity:Dict[str,torch.Tensor]=None):
         global_for_gamma=global_quantity_gamma['gamma']
         if self.type_LR=='F':
             global_XX=self.global_para_ind_quantities['XX']
@@ -733,8 +742,10 @@ class GlobalComputation():
             gamma=torch.linalg.inv(global_XX)@(global_for_gamma)
         param=Parameter(param.mu,param.sigma,gamma,param.delta,param.theta)
         return param
-    
-    def update_delta(self,param: Parameter,global_quantity_delta:Dict[str,torch.Tensor]):
+    def pre_computation_for_delta(self,param:Parameter):
+        pre_quantity={}
+        return pre_quantity 
+    def update_delta(self,param: Parameter,global_quantity_delta:Dict[str,torch.Tensor],pre_quantity:Dict[str,torch.Tensor]=None):
         global_for_delta=global_quantity_delta['delta']
         if self.type_LR=='F':
             n=self.global_para_ind_quantities['n']
@@ -746,14 +757,20 @@ class GlobalComputation():
             raise ValueError("Invalid type_LR. Choose from 'F', 'P', or 'H'.")
         param=Parameter(param.mu,param.sigma,param.gamma,delta,param.theta)
         return param
-    
-    def update_theta(self,param:Parameter,global_quantity_theta:Dict[str,torch.Tensor]):        
-        global_for_theta_gradient=global_quantity_theta['grad']
-        global_for_theta_hessian=global_quantity_theta['hessian']
-        J=self.global_para_ind_quantities['J']
+    def pre_computation_for_theta(self,param:Parameter):
+        pre_quantity={}
         com_gradient_hessian=self.Grad_Hessian_f(param)
         com_gradient=com_gradient_hessian['grad']
         com_hessian=com_gradient_hessian['hessian']
+        pre_quantity['com_gradient']=com_gradient
+        pre_quantity['com_hessian']=com_hessian
+        return pre_quantity
+    def update_theta(self,param:Parameter,global_quantity_theta:Dict[str,torch.Tensor],pre_quantity:Dict[str,torch.Tensor]):        
+        global_for_theta_gradient=global_quantity_theta['grad']
+        global_for_theta_hessian=global_quantity_theta['hessian']
+        J=self.global_para_ind_quantities['J']
+        com_gradient=pre_quantity['com_gradient']
+        com_hessian=pre_quantity['com_hessian']
         
         gradient=global_for_theta_gradient*J+com_gradient
         hessian=global_for_theta_hessian*J+com_hessian
@@ -790,13 +807,20 @@ class GlobalComputation():
             
         param=Parameter(param.mu,param.sigma,param.gamma,param.delta,theta)
         return param
-    def update_delta_theta(self,param:Parameter,global_quantity_theta:Dict[str,torch.Tensor]):        
-        global_for_gradient=global_quantity_theta['grad'].unsqueeze(1)
-        global_for_hessian=global_quantity_theta['hessian']
-        J=self.global_para_ind_quantities['J']
+    def pre_computation_for_delta_theta(self,param:Parameter):
+        pre_quantity={}
         com_gradient_hessian=self.Grad_Hessian_f(param)
         com_gradient=com_gradient_hessian['grad']
         com_hessian=com_gradient_hessian['hessian']
+        pre_quantity['com_gradient']=com_gradient
+        pre_quantity['com_hessian']=com_hessian
+        return pre_quantity
+    def update_delta_theta(self,param:Parameter,global_quantity_theta:Dict[str,torch.Tensor],pre_quantity:Dict[str,torch.Tensor]):        
+        global_for_gradient=global_quantity_theta['grad'].unsqueeze(1)
+        global_for_hessian=global_quantity_theta['hessian']
+        J=self.global_para_ind_quantities['J']
+        com_gradient=pre_quantity['com_gradient']
+        com_hessian=pre_quantity['com_hessian']
         
         d = com_gradient.numel()
 
@@ -849,6 +873,7 @@ class GlobalComputation():
             new_delta = param.delta - step_size * invh_m_grad[0]
             
         param=Parameter(param.mu,param.sigma,param.gamma,new_delta, new_theta)
+        param.invh_m_grad_norm=torch.linalg.norm(invh_m_grad)
         return param
 
 
@@ -1100,21 +1125,19 @@ class Worker():
                     self.logger.info(f"worker {self.worker_id} uses the received param from server or use local params to compute the local quantity with index {self.cur_param.index}")
             
             start_time_compuation = time.time()  
-            local_quantity=self.compute_dif_and_update_pre()
+            #local_quantity=self.compute_dif_and_update_pre()
+            local_quantity=self.compute_new_local_quantity()
             end_time_compuation = time.time()
             #if self.logger is not None:
             #    self.logger.info(f" worker {self.worker_id} computes the local quantity {local_quantity.index} end with time {end_time_compuation}")
             local_quantity.value['start_time_compuation']=start_time_compuation
             local_quantity.value['end_time_compuation']=end_time_compuation
             if self.logger is not None:
-                self.logger.info(f" worker {self.worker_id} computes the local quantity {local_quantity.index} end with time {end_time_compuation-start_time_compuation} and the torch threads: {torch.get_num_threads()}; total number of threads: {psutil.Process().num_threads()}, torch interop threads: {torch.get_num_interop_threads()}, python thread: {len(threading.enumerate())}")
-                #for pool in threadpool_info():
-                #    self.logger.info(f"pool: {pool}")
+                self.logger.info(f" worker {self.worker_id} computes the local quantity {local_quantity.index} end with time {end_time_compuation-start_time_compuation}")
             #sleep(1)
             with self.condition_send:
                 self.local_quantities.append(local_quantity)
                 self.condition_send.notify()
-                
     def receive_param(self):
         #the thread receiving parameter from server
         while not self.stop_flag.is_set():
@@ -1162,9 +1185,13 @@ class InitializationServer():
         #get the rank of local workers: from 0 to self.size, except self rank
         self.worker_ranks = [rank for rank in range(self.size) if rank != self.rank]        
         self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
+        
         self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
+        self.newest_local_quantities:LocalQuantities=LocalQuantities()
         global_computation.reset()
         self.global_computation=global_computation
+        
+        self.invh_m_grad_norm=None # The norm of the gradient of the inverse of the Hessian of the local quantity
         
         if type_LR in ['F', 'P', 'H']:
             self.type_LR=type_LR
@@ -1189,8 +1216,11 @@ class InitializationServer():
         gathered_local_quantities=self.comm.gather(local_quantity, root=self.rank)
         local_quantities_list=[local_quantity for local_quantity in gathered_local_quantities if local_quantity is not None]
         
-
         local_quantities = LocalQuantities(local_quantities_list)
+        #new code
+        self.newest_local_quantities.merge_new_local_quantilies_dict(local_quantities.local_quantities_dict)
+        
+        
         local_quantities_step = local_quantities.get_by_step(step)
         step_keys_dict={StepType.MU_SIGMA:['mu','sigma'],StepType.GAMMA:['gamma'],StepType.DELTA:['delta'],StepType.THETA:['grad','hessian'],StepType.DELTA_THETA:['grad','hessian']} 
         if self.type_LR=='P' or self.type_LR=='H':
@@ -1203,10 +1233,14 @@ class InitializationServer():
         n = len(local_quantities_step)
         global_quantity_step = {key: value / n for key, value in sum_dict.items()}
         self.global_quantities[step]=global_quantity_step
+        
+        pre_computation_dict={StepType.MU_SIGMA:self.global_computation.pre_computation_for_mu_sigma,StepType.GAMMA:self.global_computation.pre_computation_for_gamma,StepType.DELTA:self.global_computation.pre_computation_for_delta,StepType.THETA:self.global_computation.pre_computation_for_theta,StepType.DELTA_THETA:self.global_computation.pre_computation_for_delta_theta}
+        pre_quantity=pre_computation_dict[step](self.param)
         # Update parameters
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta,StepType.DELTA_THETA:self.global_computation.update_delta_theta}
-        self.param=step_func_dict[step](self.param,global_quantity_step)
-        
+        self.param=step_func_dict[step](self.param,global_quantity_step,pre_quantity)
+        if step==StepType.DELTA_THETA or step==StepType.THETA:
+            self.invh_m_grad_norm=self.param.invh_m_grad_norm
     def initialization(self,param0: Parameter,params_path:str=None,method:str='loc_opt'):
         '''
         method: 'loc_opt' or 'load' or 'direct':
@@ -1258,6 +1292,8 @@ class InitializationServer():
         self.comm.bcast(information, root=self.rank)
         gathered_para_ind_quantities=self.comm.gather(para_ind_quantity, root=self.rank)
         gathered_para_ind_quantities=[para_ind_quantity for para_ind_quantity in gathered_para_ind_quantities if para_ind_quantity is not None]
+        
+        
         sum_dict={key:sum(para_ind_quantity[key] for para_ind_quantity in gathered_para_ind_quantities) for key in keys}
         global_para_ind_quantities={key: value / self.J for key, value in sum_dict.items()}
         global_para_ind_quantities['J']=self.J
@@ -1290,7 +1326,7 @@ class InitializationServer():
     def save(self,filename:str):
         #save self.param, self.global_quantities, self.global_computation.global_para_ind_quantities
         with open(filename, 'wb') as f:
-            pickle.dump({'param': self.param, 'global_quantities': self.global_quantities, 'global_para_ind_quantities': self.global_computation.global_para_ind_quantities}, f)
+            pickle.dump({'param': self.param, 'global_quantities': self.global_quantities, 'global_para_ind_quantities': self.global_computation.global_para_ind_quantities,'newest_local_quantities':self.newest_local_quantities,'invh_m_grad_norm':self.invh_m_grad_norm}, f)
      
 class  Server():
     def __init__(self,comm: MPI.Intracomm,concurrency:int,global_computation:GlobalComputation,logger: logging.Logger,theta_logger: logging.Logger,type_LR='F',dl_th_together=False,iflog=True):
@@ -1303,7 +1339,24 @@ class  Server():
         self.J=self.size-1 # The number of workers
         #get the rank of local workers: from 0 to self.size, except self rank
         self.worker_ranks = [rank for rank in range(self.size) if rank != self.rank]        
-        self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities (in difference form) received from the workers and group by the 
+        self.local_quantities:LocalQuantities=LocalQuantities() # The local quantities  received from the workers and group by the 
+        
+        #maintain the newest local quantities for each worker that is received
+        self.newest_local_quantities:LocalQuantities=LocalQuantities()
+        
+        self.local_quantities_updated_initial:Dict[(int,StepType),bool]={}
+        for worker_id in range(1,self.J+1):
+            if not dl_th_together:
+                for step in [StepType.MU_SIGMA,StepType.GAMMA,StepType.DELTA,StepType.THETA]:
+                    self.local_quantities_updated_initial[(worker_id,step)]=False
+            else:
+                for step in [StepType.MU_SIGMA,StepType.GAMMA,StepType.DELTA_THETA]:
+                    self.local_quantities_updated_initial[(worker_id,step)]=False
+        #worker_id, step, if the local quantity is updated, initialize as False, copy from local_quantities_updated_initial (shadow copy)
+        self.local_quantities_updated:Dict[(int,StepType),bool]=self.local_quantities_updated_initial.copy()
+        #record the rounds that all local quantities are updated
+        self.rounds_all_updated:int=0
+        
         self.global_quantities:Dict[StepType,Dict[str,torch.Tensor]]={} # The global quantities that are computed from the local quantities
         self.concurrency=concurrency # The number of workers that are needed to compute the global quantities
         global_computation.reset()
@@ -1328,6 +1381,12 @@ class  Server():
         self.dl_th_together=dl_th_together # if True, the delta and theta are updated together, otherwise, they are updated separately
         self.choice_dict={}
         
+        
+        self.local_quantities_delta_theta:Dict[int,Dict[int,LocalQuantity]]={} #worker_id, iteration, local_quantity
+        for worker_id in range(1,self.J+1):
+            self.local_quantities_delta_theta[worker_id]={}
+        
+        
     def initialization(self,initialization_server_path:str):
         with open(initialization_server_path, 'rb') as f:
             initialization_server_dict:Dict= pickle.load(f)
@@ -1335,20 +1394,60 @@ class  Server():
             
         self.global_quantities=initialization_server_dict['global_quantities']
         self.global_computation.set_global_para_ind_quantities(initialization_server_dict['global_para_ind_quantities'])
+        self.newest_local_quantities:LocalQuantities=initialization_server_dict['newest_local_quantities']
+        self.invh_m_grad_norm=initialization_server_dict['invh_m_grad_norm']
+        self.invh_m_grad_norm_initial=self.invh_m_grad_norm
         
     def update_parameter_by_step(self,step:StepType):
         with self.condition_receive:
-            time_start=time.time()
             while self.local_quantities.get_count_by_step(step)<self.concurrency:
                 wait_result = self.condition_receive.wait(timeout=600)  # 5 minutes timeout
                 if not wait_result:
                     raise(f"Timeout waiting for waiting local quantities for step {step}")
+            pre_computation_dict={StepType.MU_SIGMA:self.global_computation.pre_computation_for_mu_sigma,StepType.GAMMA:self.global_computation.pre_computation_for_gamma,StepType.DELTA:self.global_computation.pre_computation_for_delta,StepType.THETA:self.global_computation.pre_computation_for_theta,StepType.DELTA_THETA:self.global_computation.pre_computation_for_delta_theta}
+            pre_quantity=pre_computation_dict[step](self.param)
+            #sleep(1)
+            self.newest_local_quantities.merge_new_local_quantilies_dict(self.local_quantities.local_quantities_dict)
+            newest_local_quantities_by_step=self.newest_local_quantities.get_by_step(step)
+            local_quantities_by_step=self.local_quantities.get_by_step(step) 
+            self.local_quantities.remove_by_step(step)
+            
+            '''
+            #if the step is DELTA_THETA, use a strategy updating the gradient
+            if step==StepType.DELTA_THETA:
+                #update the gradient
+                for worker_id in local_quantities_by_step.keys():
+                    local_quantity = local_quantities_by_step[worker_id]
+                    shape=local_quantity.value['grad'].shape
+                    # Update gradient using first-order Taylor expansion
+                    current_params = torch.cat([self.param.delta.reshape(-1), self.param.theta.reshape(-1)]) #reshape(-1) is to flatten the tensor
+                    param_diff = current_params.reshape(shape) - local_quantity.value['delta_theta_old'].reshape(shape)
+                    hessian_term = local_quantity.value['hessian'] @ param_diff
+                    local_quantity.value['grad'] = local_quantity.value['grad'] + hessian_term
+            '''
+            #update the local_quantities_updated
+            for worker_id in local_quantities_by_step.keys():
+                self.local_quantities_updated[(worker_id,step)]=True
+            
+            if all(self.local_quantities_updated.values()):
+                self.rounds_all_updated+=1
+                #print the local_quantities_updated
+                self.theta_logger.info(f"round {self.rounds_all_updated} all local quantities are updated")
+                #reset the local_quantities_updated
+                self.local_quantities_updated=self.local_quantities_updated_initial.copy()
+                #check if the local_quantities_updated is all False
+            
+            ###
+            '''for debug
             local_quantities_by_step=self.local_quantities.get_by_step(step)
             self.local_quantities.remove_by_step(step)  
             time_end=time.time()
             if self.logger is not None:
-                self.logger.info(f"server spends {time_end-time_start} seconds for waiting {self.concurrency} local quantities for step {step}")
-        
+                worker_ids=list(local_quantities_by_step.keys())
+                iterations=[local_quantities_by_step[worker_id].index[0] for worker_id in worker_ids]
+                worker_ids_iterations=[(worker_id,iteration) for worker_id,iteration in zip(worker_ids,iterations)]
+                self.logger.info(f"server uses {len(worker_ids_iterations)} new local quantities from workers {worker_ids_iterations} for updating parameter {self.param.index}")
+            '''
         #take a summation of local_quantities_by_step, then get the global quantity
         step_keys_dict = {
             StepType.MU_SIGMA: ['mu', 'sigma'],
@@ -1362,15 +1461,154 @@ class  Server():
             step_keys_dict[StepType.GAMMA].append('XX')
             if not self.dl_th_together:
                 step_keys_dict[StepType.DELTA].append('tr_inv')
+        
+        #'''
+        sum_dict = {key: 0 for key in step_keys_dict[step]}
+        num_dict={key:0 for key in step_keys_dict[step]}
+        t=self.param.index[0]
+        #if step==StepType.DELTA_THETA:
+            #if t==1:
+            #    self.theta_logger.info(f"norm_initial:{self.invh_m_grad_norm_initial}")
+            #self.theta_logger.info(f"norm:{self.invh_m_grad_norm}")
+        #the length of newest_local_quantities_by_step is the number of workers
+        #self.theta_logger.info(f"number of workers:{len(newest_local_quantities_by_step)}")
+        if step==StepType.DELTA_THETA:
+            #the index of the newest parameter among the local quantities, should be argmax
+            iterations=[local_quantity.index[0] for local_quantity in newest_local_quantities_by_step.values()]
+            worker_ids=list(newest_local_quantities_by_step.keys())
             
+            #find the index of max(iterations)
+            newest_iteration=max(iterations)
+            newest_index=iterations.index(newest_iteration)
+            
+            #get the newest worker_id, parameter, and gradient
+            newest_worker_id=worker_ids[newest_index]
+            newest_param=newest_local_quantities_by_step[newest_worker_id].value['delta_theta_old']            
+            newest_grad=newest_local_quantities_by_step[newest_worker_id].value['grad']
+            
+            '''
+            #return all indexes of the max(iterations)
+            newest_indexes=[i for i,iteration in enumerate(iterations) if iteration==newest_iteration]
+            
+            #get the newest worker_ids
+            newest_worker_ids=[worker_ids[i] for i in newest_indexes]
+
+            newest_grad_dict={worker_id:newest_local_quantities_by_step[worker_id].value['grad'] for worker_id in newest_worker_ids}
+            '''
+            
+            
+            
+        for worker_id in newest_local_quantities_by_step.keys():
+            local_quantity = newest_local_quantities_by_step[worker_id]
+            #self.theta_logger.info(f"worker:{worker_id}, step:{step}, lag:{t-local_quantity.index[0]+1}")
+            for key in step_keys_dict[step]:
+                #weight=1/(t+math.sqrt(t)-local_quantity.index[0]+1) # the weight is the inverse of the time difference(lag)
+                #weight=1 #equal weight, which is our original setting
+                #weight=1/(t+(0.5/self.invh_m_grad_norm)-local_quantity.index[0]+1)
+                #weight=1/(t-local_quantity.index[0]+1)
+                weight=1/(t+max(math.sqrt(t),self.invh_m_grad_norm_initial/self.invh_m_grad_norm)-local_quantity.index[0]+1)
+                #weight=1/(t+max(math.sqrt(t),1/self.invh_m_grad_norm)-local_quantity.index[0]+1)
+                weight=weight**2
+                
+                if self.rounds_all_updated>=3:
+                    weight=1
+                '''
+                if t<=10:
+                    weight=1/(t-local_quantity.index[0]+1)
+                else:
+                    weight=1
+                '''
+                '''
+                if t-local_quantity.index[0]<=10:
+                    weight=1
+                else:
+                    weight=0
+                '''
+                '''
+                if t<=30:
+                    if t-local_quantity.index[0]<=4:
+                        weight=1
+                    else:
+                        weight=0
+                else:
+                    weight=1
+                '''
+                #weight=1
+                if key=='grad':
+                    shape=local_quantity.value[key].shape
+                    #current_params = torch.cat([self.param.delta.reshape(-1), self.param.theta.reshape(-1)]) #reshape(-1) is to flatten the tensor
+                    param_diff = newest_param.reshape(shape) - local_quantity.value['delta_theta_old'].reshape(shape)
+                    iteration_diff=newest_iteration-local_quantity.index[0]
+                    #weight=1/(torch.norm(param_diff)+0.01)
+                    #self.theta_logger.info(f"iteration_diff:{iteration_diff},norm_diff:{torch.norm(param_diff)}")
+                    iteration=local_quantity.index[0]
+                    '''
+                    closest_iteration_dict={worker_id:min(self.local_quantities_delta_theta[worker_id].keys(), key=lambda x: abs(x - iteration)) for worker_id in newest_worker_ids}
+                    newest_worker_id,closest_iteration=min(closest_iteration_dict.items(), key=lambda x: abs(x[1] - iteration))
+                    #self.theta_logger.info(f"closest_iteration:{closest_iteration},newest_worker_id:{newest_worker_id}")
+                    
+                    newest_grad=newest_grad_dict[newest_worker_id]
+                    '''
+                    #closest_iteration=min(self.local_quantities_delta_theta[newest_worker_id].keys(), key=lambda x: abs(x - iteration))
+                    
+                    closest_iteration=min(self.local_quantities_delta_theta[newest_worker_id].items(), key=lambda x: torch.norm(x[1].value['delta_theta_old'].reshape(-1) - local_quantity.value['delta_theta_old'].reshape(-1)))[0]
+                    #closest_worker_id=newest_worker_id
+                    
+                    closest_local_quantity=self.local_quantities_delta_theta[newest_worker_id][closest_iteration]
+                    closest_param=closest_local_quantity.value['delta_theta_old']
+                    closest_grad=closest_local_quantity.value['grad']
+                    param_diff_closest=closest_param.reshape(shape) - local_quantity.value['delta_theta_old'].reshape(shape)
+                    current_param_diff=torch.cat([self.param.delta.reshape(-1), self.param.theta.reshape(-1)]).reshape(shape) -newest_param.reshape(shape)
+                    
+                    #param_diff=torch.cat([self.param.delta.reshape(-1), self.param.theta.reshape(-1)]).reshape(shape) -local_quantity.value['delta_theta_old'].reshape(shape)
+                    #self.theta_logger.info(f"newest_worker_id:{newest_worker_id},worker_id:{local_quantity.worker_id},iteration:{iteration},closest_iteration:{closest_iteration}, closed_param:{closest_param.reshape(-1).tolist()},param:{local_quantity.value['delta_theta_old'].reshape(-1).tolist()}, param_diff_closest_norm:{torch.norm(param_diff_closest)}")
+                    
+                    
+                    
+                    
+                    if torch.norm(param_diff_closest)<0.01:
+                        modified_grad = local_quantity.value[key]+newest_grad-closest_grad+local_quantity.value['hessian'] @ param_diff_closest#+local_quantity.value['hessian'] @ current_param_diff
+                        #weight=1
+                    else:
+                        #self.theta_logger.info(f"param_diff_closest:{torch.norm(param_diff_closest)}")
+                        modified_grad = local_quantity.value[key]
+                    
+                    
+                    '''
+                    if torch.norm(param_diff)<0.1:
+                        modified_grad = local_quantity.value[key] + local_quantity.value['hessian'] @ param_diff
+                    else:
+                        #self.theta_logger.info(f"iteration_diff:{iteration_diff},norm_diff:{torch.norm(param_diff)}")
+                        modified_grad = local_quantity.value[key]
+                    '''
+                    #modified_grad = local_quantity.value[key]+min(1,0.1/torch.norm(param_diff))*local_quantity.value['hessian'] @ param_diff
+                    '''
+                    if iteration_diff<10:
+                        modified_grad = local_quantity.value[key] + local_quantity.value['hessian'] @ param_diff
+                    else:
+                        modified_grad = local_quantity.value[key]
+                    '''
+                    #modified_grad = local_quantity.value[key] + local_quantity.value['hessian'] @ param_diff
+                    sum_dict[key] += modified_grad*weight
+                    
+                else:
+                    sum_dict[key] += local_quantity.value[key]*weight
+                num_dict[key] += weight
+        for key in step_keys_dict[step]:
+            
+            self.global_quantities[step][key]=sum_dict[key]/num_dict[key] 
+        #'''
+        '''
         # Initialize sum dictionary
         sum_dict = {key: 0 for key in step_keys_dict[step]}
-
+        num_dict={key:0 for key in step_keys_dict[step]}
         # Sum up all values for each key
         for work_id in local_quantities_by_step.keys():
             local_quantity = local_quantities_by_step[work_id]
             for key in step_keys_dict[step]:
                 sum_dict[key] += local_quantity.value[key]
+                num_dict[key]+=1
+        
         #     end_time_compuations.append(local_quantity.value['end_time_compuation'])
         # max_time_compuation=max(end_time_compuations)
         # if max_time_compuation>start_time:
@@ -1382,9 +1620,33 @@ class  Server():
         
         for key in step_keys_dict[step]:
             self.global_quantities[step][key]=self.global_quantities[step][key]+sum_dict[key]/self.J 
+        '''
+        
+        
+        if self.concurrency/self.J<1 and step==StepType.DELTA_THETA: # only for asynchronous case
+            #average of the last several parameters using exponential weight
+            if len(self.params)>=1:
+                theta_list=[]
+                weight_list=[]
+                j=0
+                for i in range(len(self.params)-1,-1,-1):
+                    if self.params[i].theta is not None:
+                        weight=2**(-j)
+                        theta_list.append(self.params[i].theta*weight)
+                        weight_list.append(weight)
+                        j+=1
+                        if len(theta_list)>=4:
+                            break
+            if len(theta_list)>0:
+                self.param.theta = sum(theta_list)/sum(weight_list)
+           
+            
+         
         time_start=time.time()
         step_func_dict={StepType.MU_SIGMA:self.global_computation.update_mu_Sigma,StepType.GAMMA:self.global_computation.update_gamma,StepType.DELTA:self.global_computation.update_delta,StepType.THETA:self.global_computation.update_theta,StepType.DELTA_THETA:self.global_computation.update_delta_theta}
-        self.param=step_func_dict[step](self.param,self.global_quantities[step])
+        self.param=step_func_dict[step](self.param,self.global_quantities[step],pre_quantity)
+        if step==StepType.DELTA_THETA or step==StepType.THETA:
+            self.invh_m_grad_norm=self.param.invh_m_grad_norm
         time_end=time.time()
         if self.logger is not None:
             self.logger.info(f"server spends {time_end-time_start} seconds for updating the parameter after receiving {self.concurrency} local quantities")
@@ -1411,9 +1673,14 @@ class  Server():
                 local_quantity.value['recieve_time']=recieve_time
             else: #other message from the worker
                 return
-            #self.logger.info(f"server receives the local quantity {local_quantity.index}")
+            if self.logger is not None:
+                self.logger.info(f"server receives the local quantity {local_quantity.index}")
             with self.condition_receive:
-                self.local_quantities.merge_new_dif(local_quantity)
+                self.local_quantities.merge_new(local_quantity)
+                if local_quantity.index[1]==StepType.DELTA_THETA:
+                    worker_id=local_quantity.worker_id
+                    iteration=local_quantity.index[0]
+                    self.local_quantities_delta_theta[worker_id][iteration]=local_quantity
                 self.condition_receive.notify_all()
     
     def send_param_to_worker(self,worker_rank):
@@ -1444,7 +1711,8 @@ class  Server():
     def update_parameter(self,T,S,ratio=1,inner_precision=1e-5):
         times_elapsed = [0] # start from 0
         params_GDT=[]
-        params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta)) # add the initial parameter
+        params_GDT.append(Parameter(None,None,self.param.gamma,self.param.delta,self.param.theta)) # add the initial parameter, deep copy
+        theta0=self.param.theta.clone()
         start_time_g = time.time()
         for t in range(T):
             choice=random.sample(self.worker_ranks, int(ratio*len(self.worker_ranks)))
@@ -1489,6 +1757,8 @@ class  Server():
                         if self.logger is not None:
                             self.logger.info(f"Early stopping at step {s} due to small changes")
                         self.param.index = (t+2, StepType.MU_SIGMA, 0)
+                        #if t==0:
+                        #    self.param.theta=(theta0+self.param.theta)/2 # average the initial parameter and the parameter in the initial step
                         param=Parameter(delta=self.param.delta,theta=self.param.theta,index=self.param.index)
                         with self.condition_send:
                             self.params.append(param)
@@ -1602,4 +1872,5 @@ class NonDisEstimation():
         param=self.__computation.get_local_minimizer(param0,tol)
         return param
         
+    
     
